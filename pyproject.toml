@@ -1,0 +1,13 @@
+# /mnt/work/kaya/pyproject.toml
+[project]
+name = "Kaya"
+version = "1.0.0"
+description = "AGI system with multi-server architecture"
+authors = [
+    {name = "Notritualist", email = "notritualist@gmail.com"}
+]
+readme = "README.md"
+requires-python = "=3.13.11"
+
+[tool.scikit-build]
+cmake.args = ["DGGML_CUDA=ON"]  # Flags for comlile llama.cpp
