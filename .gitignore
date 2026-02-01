@@ -46,3 +46,6 @@ data_bases/
 llama.cpp/build/
 llama.cpp/CMakeCache.txt
 llama.cpp/CMakeFiles/
+
+# Drivers
+drivers/
