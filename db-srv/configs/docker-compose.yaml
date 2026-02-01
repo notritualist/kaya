@@ -1,0 +1,30 @@
+# /mnt/work/kaya/main-srv/db-srv/configs/docker-compose.yml
+# docker-compose.yml version: 1.0.0
+version: '3.8'
+
+services:
+  postgres_db:
+    image: postgres:18.1-trixie
+    container_name: postgres_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust  # временно, для упрощения
+    volumes:
+      - postgres_nvme_data:/var/lib/postgresql
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  postgres_nvme_data:
+    external: true
