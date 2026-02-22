@@ -59,7 +59,8 @@ def main():
         if not ensure_schema_ready(postgres_config):
             logger.critical(f"Инициализация схемы базы данных Postgres не удалась")
             return 1
-
+        success = True 
+        
     except Exception as e:
         logger.critical(f"Критическая ошибка запуска {e}", exc_info=True)
         return 1

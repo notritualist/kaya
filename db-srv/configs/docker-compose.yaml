@@ -1,6 +1,5 @@
 # /mnt/work/kaya/main-srv/db-srv/configs/docker-compose.yml
 # docker-compose.yml version: 1.0.0
-version: '3.8'
 
 services:
   postgres_db:
