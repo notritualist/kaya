@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from version import __version__ as kaya_version # Версия проекта
 from db_manager.db_manager import load_postgres_config, ensure_schema_ready
-
+from interfaces.console_interface import run_console_interface
 
 def setup_logging():
     """Настройка глобального логирования с фильтрацией"""
@@ -43,7 +43,7 @@ def main():
     1. Загрузка и проверка схемы БД 
     2. 
     3. 
-    4. 
+    4. Запуск консольного интерфейса с управлением сессией
     """
 
     # Инициализация логгирования
@@ -61,6 +61,9 @@ def main():
             return 1
         success = True 
         
+        # 4. Запустить консольный интерфейс с передачей конфига БД и версии агента
+        run_console_interface(postgres_config, kaya_version)
+
     except Exception as e:
         logger.critical(f"Критическая ошибка запуска {e}", exc_info=True)
         return 1
@@ -69,8 +72,9 @@ def main():
         if success:
             logger.info("Сеанс работы успешно завершен")
         else:
-            logger.info("Сеанс завершён с ошибкой")
-
+            logger.critical("Сеанс завершён с ошибкой")
+            return 1
+        
     return 0
 
 if __name__ == "__main__":
