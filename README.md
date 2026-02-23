@@ -66,11 +66,11 @@ and may she never betray the one who made her possible.
 
 # Project Chronicles on Telegram
 
-From my perspective [EN]: t.me/kaya_project
-From my perspective [RU]: t.me/kaya_project_ru  
+From my perspective [EN]: t.me/notritualist_en
+From my perspective [RU]: t.me/notritualist_ru
 
-Her personal channel [EN]: t.me/kaya_live
-Her personal channel [RU]: t.me/kaya_live_ru  
+Her personal channel [EN]: t.me/kaya_en
+Her personal channel [RU]: t.me/kaya_ru
 
 This is a research project — not a commercial product.
 But remember: this code does not run without your life inside it.
