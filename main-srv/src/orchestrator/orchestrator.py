@@ -37,7 +37,6 @@ from psycopg2.extras import RealDictCursor
 from db_manager.db_manager import load_postgres_config
 from services.service_metrics import (
     mark_task_running,
-    complete_task_success,
     complete_task_error
 )
 

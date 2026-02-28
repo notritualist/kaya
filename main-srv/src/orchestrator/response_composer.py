@@ -19,9 +19,11 @@ __description__ = "Генерация ответа через ModelService + с�
 
 import logging
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+from orchestrator.context_builder import build_context
+from services.tokens_counter import count_tokens_qwen
 
 # Единая версия проекта — как в main.py
 from version import __version__ as kaya_version
@@ -42,6 +44,21 @@ from services.service_metrics import (
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# === КОНСТАНТЫ (единый источник для max_tokens) ==============================
+# =============================================================================
+# Почему 4096:
+# - Стандартный дефолт для Qwen3/llama-server при отсутствии параметра в промпте
+# - Баланс: достаточно для развёрнутых ответов, оставляет место под контекст
+# - Используется ЕСЛИ max_tokens не указан в params промпта
+#
+# Математика лимитов:
+# - n_ctx сервера = 8192 токенов (из model_config.yaml)
+# - max_tokens = 4096 (лимит на генерацию: ответ + <think> вместе)
+# - Доступно под контекст = 8192 - 4096 = 4096 токенов
+# - ROUGH_CONTEXT_LIMIT_TOKENS = 3600 (90% от доступного, запас 10%)
+# =============================================================================
+DEFAULT_MAX_TOKENS: int = 4096
 
 def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     """
@@ -77,6 +94,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             user_content: str = msg["row_text"]
             session_id: str = msg["session_id"]
             room_id: str = msg["room_id"]
+            user_actor_id: str = msg["actor_id"]  # ← НОВОЕ: ID актора пользователя
     
     # === 2. Получаем промпт и параметры генерации ===
     with psycopg2.connect(**db_config) as conn:
@@ -99,46 +117,91 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             system_prompt: str = prompt["text"]
             # Параметры из JSONB-поля промпта (не хардкод!)
             model_params: Dict[str, Any] = prompt["params"] or {}
+        
+    # === 3. Формируем messages для API ===
+    # 3.1: Собираем контекст: история сессии + (потом) векторный поиск
+    context_messages, context_message_ids = build_context(
+        room_id=room_id,
+        user_actor_id=user_actor_id,  # ← НОВОЕ: вместо session_id
+        current_message_id=message_id,
+        current_message_text=user_content
+    )
     
-    # === 3. Создаём шаг оркестратора ===
-    step_input: Dict[str, Any] = {
-        "message_id": message_id,
-        "prompt_id": prompt_id,
-        "user_content": user_content
-    }
-    try:
-        step_id: str = create_orchestrator_step(
-            task_id=task_id,
-            step_number=1,
-            step_type_name="user_answer_generation",
-            input_data=step_input
-        )
-    except Exception as e:
-        error = f"Не удалось создать шаг: {e}"
-        logger.error(error)
-        complete_task_error(task_id, error_module="response_composer", error_message=error)
-        return
-    
-    # === 4. Формируем messages для API ===
-    messages: List[Dict[str, str]] = [
+    # 3.2: Формируем messages
+    messages = [
         {"role": "system", "content": system_prompt},
+        *context_messages,
         {"role": "user", "content": user_content}
     ]
     
-    # === 5. Вызываем модель с параметрами из промпта ===
+    # 3.3: Проверка на переполнение
+    model_service = ModelService()
+    n_ctx = model_service.host_nctx
+    
+    # Единое значение max_tokens для РАСЧЁТА и ВЫЗОВА модели
+    max_tokens = model_params.get("max_tokens") or DEFAULT_MAX_TOKENS
+    
+    # Считаем токены всех компонентов
+    system_tokens = count_tokens_qwen(system_prompt)
+    context_tokens = sum(count_tokens_qwen(msg["content"]) for msg in context_messages)
+    user_tokens = count_tokens_qwen(user_content)
+    
+    # <think> + ответ вместе укладываются в max_tokens
+    # n_ctx = входной промпт + выход (max_tokens)
+    available_for_context = n_ctx - max_tokens # 8192 - 4096 = 4096 пример
+    total_input_tokens = system_tokens + context_tokens + user_tokens
+    
+    if total_input_tokens > available_for_context:
+        logger.warning(
+            "⚠️ Контекст превышает лимит: %d токенов (доступно: %d, n_ctx=%d, max_tokens=%d)",
+            total_input_tokens, available_for_context, n_ctx, max_tokens
+        )
+        while context_messages and total_input_tokens > available_for_context:
+            removed = context_messages.pop(0)
+            context_message_ids.pop(0)
+            removed_tokens = count_tokens_qwen(removed["content"])
+            total_input_tokens -= removed_tokens
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *context_messages,
+            {"role": "user", "content": user_content}
+        ]
+        logger.info("✅ Контекст обрезан: осталось %d сообщений, %d токенов", 
+                len(context_messages), total_input_tokens)
+    
+    # 3.4: Создаём шаг ОДИН РАЗ с финальными данными
+    step_input = {
+        "message_id": message_id,
+        "prompt_id": prompt_id,
+        "user_content": user_content,
+        "context_message_ids": context_message_ids
+    }
+    
+    step_id = create_orchestrator_step(
+        task_id=task_id,
+        step_number=1,
+        step_type_name="user_answer_generation",
+        input_data=step_input
+    )
+    logger.info("✅ Шаг %s создан: контекст=%d сообщений, токенов=%d", 
+               step_id[:8], len(context_message_ids), total_input_tokens)
+    
+    # 4. Вызов модели
+    logger.debug("Вызов ModelService.generate: %d элементов в messages", len(messages))
     model = ModelService()
     result = model.generate(
         messages=messages,
-        temperature=model_params.get("temperature"),      # ← из промпта, обязательно
+        temperature=model_params.get("temperature"),
         top_p=model_params.get("top_p"),
         top_k=model_params.get("top_k"),
         min_p=model_params.get("min_p"),
-        max_tokens=model_params.get("max_tokens"),
+        max_tokens=max_tokens,  # ← ИСПОЛЬЗУЕМ ТО ЖЕ ЗНАЧЕНИЕ, что в расчёте выше
         presence_penalty=model_params.get("presence_penalty"),
-        stop=model_params.get("stop")                      # ← список стоп-токенов из промпта
+        stop=model_params.get("stop")
     )
     
-    # === 6. Обработка результата ===
+    # === 5. Обработка результата ===
     if not result["success"]:
         error = result.get("error", "Неизвестная ошибка модели")
         logger.error(f"❌ Ошибка генерации: {error}")
@@ -146,12 +209,12 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         complete_task_error(task_id, error_module="response_composer", error_message=error)
         return
     
-     # === 7. Извлекаем рассуждение и чистый ответ ===
+     # === 6. Извлекаем рассуждение и чистый ответ ===
     clean_response = result["response"]        # уже чистый, без <think>
     think_content = result.get("reasoning", "")  # ← берём из отдельного поля
     logger.debug("Ответ: %d симв., рассуждение: %d симв.",len(clean_response), len(think_content))
 
-    # === 8. Сохраняем рассуждение в orchestrator.reasonings (если есть) ===
+    # === 7. Сохраняем рассуждение в orchestrator.reasonings (если есть) ===
     reasoning_id = None
     if think_content:
         reasoning_id = save_reasoning(
@@ -162,7 +225,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         set_step_reasoning_id(step_id, reasoning_id)
         logger.debug("Рассуждение сохранено: %s", reasoning_id[:8] if reasoning_id else "N/A")
     
-    # === 9. Сохраняем метрики LLM в metrics.llm_internal ===
+    # === 8. Сохраняем метрики LLM в metrics.llm_internal ===
     metrics: Dict[str, Any] = result["metrics"]
     llm_metric_id: str = save_llm_metrics(
         orchestrator_step_id=step_id,
@@ -185,7 +248,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         error_status=False
     )
     
-    # === 10. Вычисляем answer_latency ===
+    # === 9. Вычисляем answer_latency ===
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Получаем timestamp родительского сообщения
@@ -200,7 +263,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             answer_timestamp = datetime.now(timezone.utc)
             answer_latency = (answer_timestamp - parent_timestamp).total_seconds()
 
-    # === 11. Сохраняем ЧИСТЫЙ ответ в dialogs.messages ===
+    # === 10. Сохраняем ЧИСТЫЙ ответ в dialogs.messages ===
     try:
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor() as cur:
@@ -214,7 +277,6 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                 system_actor_id: str = system_actor[0]
                 
                 # Считаем токены чистого ответа (для статистики)
-                from services.tokens_counter import count_tokens_qwen
                 token_count: int = count_tokens_qwen(clean_response)
                 
                 # Вставляем ответ с parent_message_id = сообщение пользователя
@@ -260,7 +322,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         complete_task_error(task_id, error_module="response_composer", error_message=str(e))
         return
     
-    # === 12. Завершаем шаг и задачу ===
+    # === 11. Завершаем шаг и задачу ===
     step_output: Dict[str, Any] = {
         "response": clean_response,
         "reasoning_id": reasoning_id,

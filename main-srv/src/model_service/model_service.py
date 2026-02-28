@@ -38,7 +38,6 @@ main-srv/src/model_service/model_service.py
 __version__ = "1.0.0"
 __description__ = "HTTP-клиент для llama-server с FIFO-очередью"
 
-import json
 import yaml
 import time
 import logging
