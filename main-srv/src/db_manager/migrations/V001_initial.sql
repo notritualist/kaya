@@ -821,7 +821,7 @@ EXECUTE FUNCTION orchestrator.populate_step_enriched_fields();
 -- Добавляем FK из reasonings → orchestrator_steps
 ALTER TABLE orchestrator.reasonings
 ADD CONSTRAINT fk_reasonings_orchestrator_step_id
-FOREIGN KEY (orchestrator_step_id) REFERENCES orchestrator.orchestrator_steps(id) ON DELETE RESTRICT;
+FOREIGN KEY (orchestrator_step_id) REFERENCES orchestrator.orchestrator_steps(id) ON DELETE SET NULL;
 
 
 -- Блок 13: Создание таблицы метрик внутренних LLM запросов
@@ -1123,4 +1123,4 @@ CREATE INDEX IF NOT EXISTS idx_messages_processed_text_search ON dialogs.message
 -- Добавляем FK в orchestrator.preprocessed_results
 ALTER TABLE orchestrator.preprocessed_results
     ADD CONSTRAINT fk_preprocessed_results_message_id
-    FOREIGN KEY (message_id) REFERENCES dialogs.messages(id) ON DELETE RESTRICT;
+    FOREIGN KEY (message_id) REFERENCES dialogs.messages(id) ON DELETE SET NULL;

@@ -15,25 +15,33 @@ from session_services.session_manager import SessionManager
 
 def setup_logging():
     """Настройка глобального логирования с фильтрацией"""
-    # Определяем путь относительно файла проекта
     project_root = Path(__file__).parent.parent
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
     
-    # Базовая конфигурация
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='[%(asctime)s] %(levelname)-8s | %(name)-15s | %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / "kaya_full.log", encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+    # Создаем логгер
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # Корневой логгер ловит всё
     
-    # Настройка уровней для консоли
-    for handler in logging.root.handlers:
-        if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
-            handler.setLevel(logging.WARNING) # Только WARNING и выше в консоль
+    # Форматтер
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)-8s | %(name)-15s | %(message)s')
+    
+    # 1. Файловый handler - пишет ВСЁ (DEBUG и выше)
+    file_handler = logging.FileHandler(log_dir / "kaya_full.log", encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    
+    # 2. Консольный handler - только WARNING и выше
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(formatter)
+    
+    # Удаляем старые handlers
+    logger.handlers.clear()
+    
+    # Добавляем новые
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
     
     return logging.getLogger(__name__)
 
