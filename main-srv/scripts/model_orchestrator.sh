@@ -30,6 +30,7 @@ exec "$SERVER_BIN" \
   --n-gpu-layers -1 \
   --cache-type-k f16 \
   --cache-type-v f16 \
+  --jinja \
   --threads 4 \
   --batch-size 2048 \
   --parallel 1 \
