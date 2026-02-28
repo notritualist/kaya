@@ -303,79 +303,47 @@ class SessionManager:
         room_id = str(room_row['id'])
 
         # === === === === === === === === === === === === === === === === === === ===
-        # === ОПРЕДЕЛЯЕМ parent_message_id ДЛЯ ПОЛЬЗОВАТЕЛЯ (с учётом мультиюзерности) ===
+        # === ВЫЧИСЛЯЕМ parent_message_id И user_think_latency (ТОЛЬКО в рамках ТЕКУЩЕЙ сессии!) ===
         # === === === === === === === === === === === === === === === === === === ===
         # Логика:
-        # - Если в комнате есть ответ системы (actor_type='system'), где parent_message_id 
-        #   ведёт к сообщению ЭТОГО пользователя → это и есть parent для нового сообщения
-        # - Если таких нет (первое сообщение пользователя в комнате) → parent = NULL
+        # - Ищем последнее релевантное событие ТОЛЬКО в текущей сессии (не комнате!)
+        # - Если это первое сообщение в сессии → parent = NULL, latency = NULL
         
         parent_message_id: Optional[str] = None
-        
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Находим последний ответ системы, адресованный этому пользователю
-                cur.execute("""
-                    SELECT m.id
-                    FROM dialogs.messages m
-                    WHERE m.room_id = %s
-                    AND m.actor_type = 'system'
-                    AND m.parent_message_id IN (
-                        SELECT id FROM dialogs.messages 
-                        WHERE actor_id = %s AND room_id = %s
-                    )
-                    ORDER BY m.timestamp DESC
-                    LIMIT 1
-                """, (room_id, self.actor_id, room_id))
-                
-                last_agent_reply = cur.fetchone()
-                if last_agent_reply:
-                    parent_message_id = str(last_agent_reply['id'])
-                    logger.debug("parent_message_id для пользователя: %s (ответ агента)", parent_message_id[:8])
-                # else: первое сообщение → parent_message_id остаётся None
-
-        # === === === === === === === === === === === === === === === === === === ===
-        # === ВЫЧИСЛЯЕМ answer_latency ДЛЯ ПОЛЬЗОВАТЕЛЯ (с учётом мультиюзерности) ===
-        # === === === === === === === === === === === === === === === === === === ===
-        # Логика:
-        # - Для system: latency = время ответа на вопрос пользователя (уже считается в response_composer)
-        # - Для user/owner: latency = время с последнего релевантного события в диалоге ЭТОГО пользователя
-        #   (ответ системы ему ИЛИ его предыдущее сообщение в этой комнате)
-        
         user_think_latency: Optional[float] = None
-        
+
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Находим последнее сообщение в комнате, на которое логически отвечает пользователь:
-                # 1. Ответ системы, где parent — сообщение этого пользователя, ИЛИ
-                # 2. Предыдущее сообщение этого же пользователя в этой комнате
+                # Находим последнее релевантное событие в ТЕКУЩЕЙ сессии:
+                # 1. Ответ системы, где parent — сообщение этого пользователя в ЭТОЙ сессии, ИЛИ
+                # 2. Предыдущее сообщение этого пользователя в ЭТОЙ сессии
                 cur.execute("""
-                    SELECT m.timestamp
+                    SELECT m.id, m.timestamp
                     FROM dialogs.messages m
-                    WHERE m.room_id = %s
-                    AND (
-                        -- Ответ системы, адресованный этому пользователю (через parent)
-                        (m.actor_type = 'system' AND m.parent_message_id IN (
-                            SELECT id FROM dialogs.messages 
-                            WHERE actor_id = %s AND room_id = %s
-                        ))
-                        OR
-                        -- Предыдущее сообщение этого пользователя
-                        (m.actor_id = %s AND m.actor_type != 'system')
-                    )
+                    WHERE m.session_id = %s
+                        AND (
+                            (m.actor_type = 'system' 
+                            AND m.parent_message_id IN (
+                                SELECT id FROM dialogs.messages 
+                                WHERE session_id = %s AND actor_id = %s
+                            )
+                            )
+                            OR (m.actor_id = %s AND m.actor_type != 'system')
+                        )
                     ORDER BY m.timestamp DESC
                     LIMIT 1
-                """, (room_id, self.actor_id, room_id, self.actor_id))
+                """, (self.session_id, self.session_id, self.actor_id, self.actor_id))
                 
                 prev_row = cur.fetchone()
                 if prev_row:
-                    prev_timestamp = prev_row['timestamp']  # TIMESTAMPTZ
+                    parent_message_id = str(prev_row['id'])
+                    prev_timestamp = prev_row['timestamp']
                     current_timestamp = datetime.now(timezone.utc)
                     user_think_latency = (current_timestamp - prev_timestamp).total_seconds()
-                    logger.debug("user_think_latency: %.2f сек (с %s)", 
-                            user_think_latency, prev_timestamp.isoformat()[:19])
-                # else: первое сообщение в комнате → latency = None
-        
+                    logger.debug("parent_message_id: %s, user_think_latency: %.2f сек", 
+                            parent_message_id[:8], user_think_latency)
+                # else: первое сообщение в сессии → оба значения остаются None
+       
         # Вставляем сообщение
         row = self._query("""
             INSERT INTO dialogs.messages 
@@ -396,14 +364,14 @@ class SessionManager:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, params=(
-            parent_message_id,  # ← NULL для первого сообщения, ID ответа агента для последующих
+            parent_message_id,   # ← NULL для первого сообщения в сессии
             self.actor_id,
             self.actor_type,
-            self.session_id,
+            self.session_id,     # ← текущая сессия
             room_id,
             content,
             token_count,
-            user_think_latency,  # ← Вычисленное значение (может быть None)
+            user_think_latency,  # ← NULL для первого сообщения в сессии)
             self.kaya_version,
             datetime.now(timezone.utc),
             None,  # orchestrator_step_id = NULL для пользовательских сообщений

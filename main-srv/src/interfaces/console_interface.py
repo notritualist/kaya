@@ -22,7 +22,7 @@ import logging
 import pwd
 import os
 from session_services.session_manager import SessionManager
-from session_services.session_manager import SessionManager
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys

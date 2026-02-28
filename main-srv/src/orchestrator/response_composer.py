@@ -121,6 +121,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     # === 3. Формируем messages для API ===
     # 3.1: Собираем контекст: история сессии + (потом) векторный поиск
     context_messages, context_message_ids = build_context(
+        session_id=session_id,      # ← сессия
         room_id=room_id,
         user_actor_id=user_actor_id,  # ← НОВОЕ: вместо session_id
         current_message_id=message_id,
