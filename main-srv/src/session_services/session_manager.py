@@ -67,6 +67,7 @@ class SessionManager:
         self.session_id: Optional[str] = None
         self.actor_id: Optional[str] = None      # UUID актора (owner или user)
         self.actor_type: str = 'owner'           # Тип: 'owner' или 'user'
+        self.actor_external_id: Optional[str] = None  # кэш внешнего ID
         self._conn = None
                 
         logger.debug(f"SessionManager создан для {console_user_id}")
@@ -80,29 +81,22 @@ class SessionManager:
     
     def _query(self, sql: str, params: tuple = None, fetch: bool = False):
         """
-        Вспомогательный метод для выполнения SQL-запросов.
+        Выполняет SQL-запрос с авто-коммитом.
         
-        Args:
-            sql: запрос с плейсхолдерами %s
-            params: кортеж параметров
-            fetch: если True — вернуть результат fetchone()
-        
-        Returns:
-            Результат запроса или None
+        ВАЖНО: commit() вызывается ДО return, чтобы данные сразу попадали в БД.
         """
         conn = self._get_conn()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, params or ())
-                if fetch:
-                    return cur.fetchone()
-                conn.commit()
+                result = cur.fetchone() if fetch else None
+                conn.commit()  # ← КОММИТ ПЕРЕД ВОЗВРАТОМ (был после return — баг!)
+                return result
         except psycopg2.Error as e:
             conn.rollback()
             logger.error(f"Ошибка БД: {e}\nSQL: {sql}\nParams: {params}", exc_info=True)
             raise
-    
-    
+        
     def ensure_actor_linked(self) -> bool:
         """
         Привязывает текущего пользователя консоли к актору.
@@ -128,7 +122,8 @@ class SessionManager:
         if existing:
             self.actor_id = str(existing['actor_id'])
             self.actor_type = str(existing['type'])
-            logger.debug(f"{self.console_user_id} уже привязан к {self.actor_type}#{self.actor_id}")
+            self.actor_external_id = str(existing['id'])  # ← ДОБАВИЛИ: загружаем внешний ID
+            logger.debug(f"{self.console_user_id} уже привязан к {self.actor_type}#{self.actor_id}, external_id={self.actor_external_id[:8]}")
             return False
         
         # === ШАГ 2: Пользователь новый — определяем, к кому привязывать ===
@@ -171,23 +166,56 @@ class SessionManager:
             self.actor_id = str(owner_row['id'])
             self.actor_type = 'owner'
         
-        # === ШАГ 3: Создаём привязку внешнего ID ===
-        self._query("""
+        ## === ШАГ 3: Создаём привязку внешнего ID ===
+        ext_row = self._query("""
             INSERT INTO users.actors_external_ids 
             (actor_id, source, source_id, authorized, kaya_version)
             VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, params=(
             self.actor_id,
             'console',
             self.console_user_id,
             True,
             self.kaya_version
-        ))
+        ), fetch=True)  # ← ДОБАВИЛИ: RETURNING + fetch=True
+        
+        # Сохраняем actor_external_id в кэш класса
+        if ext_row:
+            self.actor_external_id = str(ext_row['id'])
+            logger.debug("actor_external_id сохранён: %s", self.actor_external_id[:8])
         
         logger.info(f"Привязка создана: {self.actor_type}#{self.actor_id} ↔ {self.console_user_id}")
         return True
-    
 
+    @staticmethod
+    def close_dangling_sessions(db_config: dict) -> int:
+        """
+        Завершает «зависшие» активные сессии при перезапуске системы.
+        
+        Args:
+            db_config: параметры подключения к PostgreSQL
+            
+        Returns:
+            int: количество закрытых сессий
+        """
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE dialogs.sessions
+                    SET 
+                        status = 'completed'::session_status,
+                        closed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE status = 'active'
+                """)
+                count = cur.rowcount
+                conn.commit()
+                
+                if count > 0:
+                    logger.warning("🔄 Завершено %d зависших сессий при старте", count)
+                return count         
+ 
     def create_session(self, room_name: str = "open_dialogue") -> str:
         """
         Создаёт НОВУЮ сессию диалога.
@@ -215,17 +243,17 @@ class SessionManager:
         
         if not room_row:
             raise ValueError(f"Комната '{room_name}' не найдена или неактивна")
-        
         room_id = str(room_row['id'])
-        
-        # Создаём сессию
+
+        # Создаём сессию с actor_external_id из кэша (уже привязан к источнику)
         row = self._query("""
             INSERT INTO dialogs.sessions 
-            (actor_id, status, last_room, kaya_version)
-            VALUES (%s, %s, %s, %s)
+            (actor_id, actor_external_id, status, last_room, kaya_version)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING id
         """, params=(
             self.actor_id,
+            self.actor_external_id,  # ← Берём из кэша (привязан к console + user_id)
             'active',
             room_id,
             self.kaya_version
@@ -235,7 +263,7 @@ class SessionManager:
             raise RuntimeError("Не удалось создать сессию в БД")
         
         self.session_id = str(row['id'])
-        logger.info(f"Сессия создана: {self.session_id}")
+        logger.info("Сессия создана: %s", self.session_id[:8])
         return self.session_id
     
     def save_message(self, content: str, room_name: str = "open_dialogue") -> str:
@@ -342,3 +370,53 @@ class SessionManager:
         finally:
             self.cleanup()
         return False
+        
+    def wait_for_agent_response(self, user_message_id: str, timeout_seconds: int = 120) -> str:
+        """
+        Блокирующее ожидание появления ответа агента в БД.
+        
+        Проверяет dialogs.messages на появление сообщения с:
+        - parent_message_id = user_message_id
+        - actor_type = 'system'
+        
+        Args:
+            user_message_id (str): ID сообщения пользователя
+            timeout_seconds (int): Максимальное время ожидания (сек)
+            
+        Returns:
+            str: Чистый текст ответа агента (без <think>)
+            
+        Raises:
+            TimeoutError: Если ответ не появился за timeout_seconds
+        """
+        import time
+        start_time: float = time.time()
+        
+        while True:
+            elapsed: float = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                raise TimeoutError(
+                    f"Ответ не получен за {timeout_seconds} сек на сообщение {user_message_id}"
+                )
+            
+            try:
+                with psycopg2.connect(**self.db_config) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute("""
+                            SELECT row_text
+                            FROM dialogs.messages
+                            WHERE parent_message_id = %s
+                              AND actor_type = 'system'::actor_type
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        """, (user_message_id,))
+                        row = cur.fetchone()
+                        if row:
+                            # Возвращаем чистый ответ (без <think> — он уже в reasonings)
+                            return row["row_text"]
+            except Exception as e:
+                logger.warning("⚠️ Ошибка при ожидании ответа: %s", e)
+            
+            # Пауза перед следующей проверкой
+            remaining: float = timeout_seconds - elapsed
+            time.sleep(min(0.5, remaining))

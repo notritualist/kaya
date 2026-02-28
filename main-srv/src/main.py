@@ -10,6 +10,8 @@ from pathlib import Path
 from version import __version__ as kaya_version # Версия проекта
 from db_manager.db_manager import load_postgres_config, ensure_schema_ready
 from interfaces.console_interface import run_console_interface
+from orchestrator.orchestrator import start_orchestrator
+from session_services.session_manager import SessionManager
 
 def setup_logging():
     """Настройка глобального логирования с фильтрацией"""
@@ -40,9 +42,10 @@ def main():
     """
     Точка входа проекта.
     Последовательность:
-    1. Загрузка и проверка схемы БД 
-    2. 
-    3. 
+    1. Логгирование старта агента
+    2. Загрузка и проверка схемы БД 
+    3. Очистка зависших после рестарта сессий диалогов пользователей
+    3. Запустить цикл оркестратора
     4. Запуск консольного интерфейса с управлением сессией
     """
 
@@ -61,6 +64,12 @@ def main():
             return 1
         success = True 
         
+        # 3. Очистка зависших до рестарта сессий
+        SessionManager.close_dangling_sessions(postgres_config)
+        
+        # 3. Запустить цикл оркестратора
+        start_orchestrator()
+
         # 4. Запустить консольный интерфейс с передачей конфига БД и версии агента
         run_console_interface(postgres_config, kaya_version)
 

@@ -631,7 +631,6 @@ ON CONFLICT (step_name) DO NOTHING;
 CREATE TABLE IF NOT EXISTS orchestrator.orchestrator_tasks (
     id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
     task_type_id UUID NOT NULL REFERENCES orchestrator.task_types(id) ON DELETE RESTRICT,
-    task_type_name TEXT,
     parent_task_id UUID REFERENCES orchestrator.orchestrator_tasks(id),
     input_data JSONB,
     output_data JSONB,
@@ -654,7 +653,6 @@ COMMENT ON TABLE orchestrator.orchestrator_tasks IS 'Динамическая т
 -- Комментарии к колонкам
 COMMENT ON COLUMN orchestrator.orchestrator_tasks.id IS 'Уникальный идентификатор задачи (UUID)';
 COMMENT ON COLUMN orchestrator.orchestrator_tasks.task_type_id IS 'Ссылка на тип задачи из справочника task_types.';
-COMMENT ON COLUMN orchestrator.orchestrator_tasks.task_type_name IS 'Человекочитаемое название типа задачи (копия из orchestrator.task_types.type_name). Заполняется автоматически.';
 COMMENT ON COLUMN orchestrator.orchestrator_tasks.parent_task_id IS 'Ссылка на родительскую задачу.';
 COMMENT ON COLUMN orchestrator.orchestrator_tasks.input_data IS 'Входные данные для выполнения задачи в формате JSONB';
 COMMENT ON COLUMN orchestrator.orchestrator_tasks.output_data IS 'Результат выполнения задачи в формате JSONB';
@@ -684,20 +682,6 @@ CREATE INDEX IF NOT EXISTS idx_orchestrator_tasks_priority ON orchestrator.orche
 -- GIN индекс для JSONB полей
 CREATE INDEX IF NOT EXISTS idx_orchestrator_tasks_input_data ON orchestrator.orchestrator_tasks USING gin (input_data);
 CREATE INDEX IF NOT EXISTS idx_orchestrator_tasks_output_data ON orchestrator.orchestrator_tasks USING gin (output_data);
-
--- Триггер для автоматического заполнения task_type_name
-CREATE OR REPLACE FUNCTION orchestrator.populate_task_type_name()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.task_type_id IS NOT NULL THEN
-        SELECT tt.type_name
-        INTO NEW.task_type_name
-        FROM orchestrator.task_types tt
-        WHERE tt.id = NEW.task_type_id;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
 
 
 -- Блок 11: Таблица рассуждений (reasonings)

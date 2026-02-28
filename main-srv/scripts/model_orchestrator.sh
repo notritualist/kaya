@@ -26,7 +26,7 @@ echo "   Server: $SERVER_BIN"
 
 exec "$SERVER_BIN" \
   -m "$MODEL_PATH" \
-  --ctx-size 32768 \
+  --ctx-size 8192 \
   --n-gpu-layers -1 \
   --cache-type-k f16 \
   --cache-type-v f16 \
