@@ -2,6 +2,7 @@
 main-srv/src/interfaces/console_interface.py
 
 Консольный интерфейс для диалога с AGI-агентом Кая.
+С поддержкой многострочного ввода (Shift+Enter = новая строка, Enter = отправить)
 
 Логика работы:
 1. При старте определяет текущего пользователя ОС (Linux).
@@ -20,13 +21,11 @@ __description__ = "Консольный интерфейс диалога с Kay
 import logging
 import pwd
 import os
-import time
-from pathlib import Path
-from typing import Optional
-
-# Импортируем сервисы проекта
-from services.tokens_counter import count_tokens_qwen
 from session_services.session_manager import SessionManager
+from session_services.session_manager import SessionManager
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 
 # Получаем логгер для этого модуля
 logger = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ def _print_welcome(kaya_version: str, console_user_id: str, actor_type: str):
     print(f"\n{'='*66}")
     print(f"🤖  Кая (версия {kaya_version})")
     print(f"👤  Режим: {actor_type} (уровень доступа) | Пользователь: {console_user_id}")
-    print(f"💡  Введите ваш вопрос или 'exit/выход' для завершения сессии")
+    print(f"💡  Enter = отправить, Alt+Enter = новая строка, exit/выход или Ctrl+C для выхода")
     print(f"{'='*66}\n")
 
 
@@ -68,6 +67,49 @@ def _print_status(message: str, is_success: bool):
     color = COLOR_GREEN if is_success else COLOR_RED
     
     print(f"{color}[{symbol}] {message}{COLOR_RESET}")
+
+
+def create_prompt_session() -> PromptSession:
+    """
+    Создаёт сессию prompt_toolkit с поддержкой:
+    - Enter = отправить сообщение
+    - Alt+Enter = новая строка
+    - Ctrl+C = аварийный выход
+    """
+    bindings = KeyBindings()
+    
+    # Alt+Enter = новая строка (приоритет выше, чем Enter)
+    @bindings.add(Keys.Escape, Keys.Enter)
+    def _(event):
+        event.current_buffer.insert_text('\n')
+    
+    # Enter = отправить
+    @bindings.add(Keys.Enter)
+    def _(event):
+        event.current_buffer.validate_and_handle()
+    
+    # Ctrl+C = аварийный выход
+    @bindings.add('c-c')
+    def _(event):
+        raise KeyboardInterrupt()
+    
+    return PromptSession(
+        key_bindings=bindings,
+        multiline=True,
+        enable_history_search=True,
+    )
+
+
+def get_user_input(session: PromptSession) -> str:
+    """
+    Получает ввод от пользователя.
+    Выбрасывает KeyboardInterrupt при Ctrl+C.
+    """
+    try:
+        result = session.prompt(message='\n👤 Вы: ')
+        return (result or "").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt()
 
 
 def run_console_interface(db_config: dict, kaya_version: str):
@@ -99,15 +141,19 @@ def run_console_interface(db_config: dict, kaya_version: str):
         # Каждый запуск консоли = новая сессия (не возобновляем старые)
         session_id = session_service.create_session(room_name="open_dialogue")
         logger.info(f"Создана новая сессия диалога: {session_id}")
-        _print_status(f"Сессия #{session_id} начата", True)
+        _print_status(f"Сессия #{session_id[:8]} начата", True)
         
         # === ШАГ 5: Вывод приветствия (теперь все данные известны) ===
         _print_welcome(kaya_version, console_user_id, session_service.actor_type)
+        
+        # === ШАГ 5.1: Создаём сессию ввода ===
+        prompt_session = create_prompt_session()
 
         # === ШАГ 6: Основной цикл диалога ===
         while True:
             try:
-                user_input = input("\n👤 Вы: ").strip()
+                # Получаем многострочный ввод
+                user_input = get_user_input(prompt_session)
                 
                 # Обработка команд выхода
                 if user_input.lower() in ("exit", "выход"):
@@ -117,18 +163,18 @@ def run_console_interface(db_config: dict, kaya_version: str):
                 if not user_input:
                     continue
                 
-                logger.debug(f"Получено сообщение от пользователя: '{user_input[:50]}...'")
+                logger.debug(f"Получено сообщение от пользователя: {len(user_input)} симв.")
                 
                 # 6.1: Сохраняем сообщение в БД
-                message_id = message_id = session_service.save_message(
+                message_id = session_service.save_message(
                     content=user_input,
                     room_name="open_dialogue"
                 )
-                logger.debug(f"Сообщение сохранено в БД с ID: {message_id}")
+                logger.debug(f"Сообщение сохранено в БД с ID: {message_id[:8]}")
                 
                 # 6.2: Создаём задачу для оркестратора
                 from orchestrator.orchestrator_entry import on_user_message
-                on_user_message(message_id)  # ← Создаёт pending-задачу в orchestrator_tasks
+                on_user_message(message_id)
                                 
                 # 6.3: Обновляем время активности сессии
                 session_service.update_activity()
@@ -137,18 +183,14 @@ def run_console_interface(db_config: dict, kaya_version: str):
                 status_text = "⚙️  Кая думает..."
                 print(f"\n{status_text}", end="", flush=True)
 
-                # 6.5: Ожидаем ответ от агента (теперь через оркестратор)
-                # Ждём появления ответа в БД
+                # 6.5: Ожидаем ответ от агента
                 kaya_response = session_service.wait_for_agent_response(
                     user_message_id=message_id,
-                    timeout_seconds=120  # 2 минуты на генерацию
+                    timeout_seconds=120
                 )
 
-                # 6.6: ЗАМЕНЯЕМ статус на ответ (корректно)
+                # 6.6: Заменяем статус на ответ
                 if kaya_response:
-                    # \r — возврат в начало строки
-                    # пробелы — затереть "Кая думает..."
-                    # затем печатаем ответ
                     print(f"\r{' ' * len(status_text)}\r🤖 Кая: {kaya_response}\n", end="", flush=True)
                     logger.info("Ответ агента получен: %d симв.", len(kaya_response))
                 else:
@@ -180,13 +222,3 @@ def run_console_interface(db_config: dict, kaya_version: str):
         logger.debug("Ресурсы консольного интерфейса освобождены")
     
     return 0
-
-
-def _wait_for_response_stub(session_service, user_message_id: str, timeout_seconds: int = 30) -> str:
-    """
-    ЗАГЛУШКА: ожидание ответа от агента.
-    
-    Пока оркестратор не подключён, возвращаем тестовый ответ.
-    """
-    time.sleep(0.5)
-    return "Это тестовый ответ Kaya. В следующей версии здесь будет реальный ответ от модели Qwen3-8B. 🧠"
