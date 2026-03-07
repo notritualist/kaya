@@ -11,7 +11,7 @@ main-srv/src/interfaces/console_interface.py
 Схема БД: dialogs.sessions, dialogs.messages, users.actors, users.actors_external_ids
 Версия миграции: V001
 """
-version = "1.0.0"
+version = "1.1.0"
 description = "Консольный интерфейс диалога с Kaya (owner-режим)"
 import logging
 import pwd
@@ -156,10 +156,7 @@ def run_console_interface(db_config: dict, kaya_version: str):
                 logger.debug(f"Получено сообщение от пользователя: {len(user_input)} симв.")
                 
                 # 6.1: Сохраняем сообщение в БД
-                message_id = session_service.save_message(
-                    content=user_input,
-                    room_name="open_dialogue"
-                )
+                message_id = session_service.save_message(content=user_input)
                 logger.debug(f"Сообщение сохранено в БД с ID: {message_id[:8]}")
                 
                 # 6.2: Создаём задачу для оркестратора

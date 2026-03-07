@@ -14,7 +14,7 @@ main-srv/src/orchestrator/response_composer.py
 6. Завершить задачу/шаг оркестратора
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Генерация ответа через ModelService + сохранение в БД"
 
 import logging
@@ -122,7 +122,6 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     # 3.1: Собираем контекст: история сессии + (потом) векторный поиск
     context_messages, context_message_ids = build_context(
         session_id=session_id,      # ← сессия
-        room_id=room_id,
         user_actor_id=user_actor_id,  # ← НОВОЕ: вместо session_id
         current_message_id=message_id,
         current_message_text=user_content
@@ -175,7 +174,6 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     step_input = {
         "message_id": message_id,
         "prompt_id": prompt_id,
-        "user_content": user_content,
         "context_message_ids": context_message_ids
     }
     
@@ -189,7 +187,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                step_id[:8], len(context_message_ids), total_input_tokens)
     
     # 4. Вызов модели
-    logger.debug("Вызов ModelService.generate: %d элементов в messages", len(messages))
+    logger.debug("Вызов ModelService.generate: %d элементов в истории messages", len(messages))
     model = ModelService()
     result = model.generate(
         messages=messages,
@@ -288,6 +286,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                         actor_type,
                         session_id,
                         room_id,
+                        effective_room_id,
                         row_text,
                         token_count,
                         answer_latency,
@@ -295,7 +294,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                         timestamp,
                         orchestrator_step_id,
                         llm_metric_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     message_id,              # ← parent = сообщение пользователя
@@ -303,18 +302,20 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                     "system",
                     session_id,
                     room_id,
+                    room_id,                 # ← effective_room_id = room_id по умолчанию
                     clean_response,          # ← БЕЗ <think>, только чистый ответ
                     token_count,
                     answer_latency,
-                    kaya_version,            # ← из version.py, не хардкод
+                    kaya_version,
                     datetime.now(timezone.utc),
                     step_id,
                     llm_metric_id
                 ))
+                response_message_id = str(cur.fetchone()[0])  # ← СОХРАНЯЕМ ID
                 conn.commit()
                 logger.info(
-                    "✅ Ответ сохранён: parent=%s..., чистый=%d симв., токены=%d",
-                    message_id[:8], len(clean_response), token_count
+                    "✅ Ответ сохранён: parent=%s..., ответ=%s..., чистый=%d симв., токены=%d ",
+                    message_id[:8], response_message_id[:8], len(clean_response), token_count
                 )
                 
     except Exception as e:
@@ -325,10 +326,14 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     
     # === 11. Завершаем шаг и задачу ===
     step_output: Dict[str, Any] = {
-        "response": clean_response,
-        "reasoning_id": reasoning_id,
+        "response_message_id": str(response_message_id),  # ← ID сообщения в dialogs.messages
         "llm_metric_id": llm_metric_id
     }
+
+    # reasoning_id добавляем только если есть (он уже в колонке steps.reasoning_id)
+    if reasoning_id:
+        step_output["reasoning_id"] = reasoning_id
+
     complete_step_success(step_id, output_data=step_output)
     complete_task_success(task_id, output_data=step_output)
     logger.info("✅ Задача %s... завершена успешно", task_id[:8])
