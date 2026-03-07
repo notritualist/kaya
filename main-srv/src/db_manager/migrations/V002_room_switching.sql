@@ -333,11 +333,14 @@ BEGIN
             E'ПРАВИЛА:\n' ||
             E'1. room_weights: сумма = 100\n' ||
             E'2. user_rejected: true только если пользователь просит хочет семнить комнату ("давай о финансах", "перейдём к спорту")\n\n' ||
+            E'3. confidence: уверенность 0.0–1.0 (1.0 = абсолютно уверен, 0.5 = сомневаешься)\n\n' ||
             E'ФОРМАТ JSON (строго!):\n' ||
-            E'{"room_weights":{"open_dialogue":0,"agent_dev":0,"goals_projects":0,"finance":0,"digital_world":0,"sport":0,"nutrition":0},"user_rejected":false}\n\n' ||
+            E'{"room_weights":{"open_dialogue":0,"agent_dev":0,"goals_projects":0,"finance":0,"digital_world":0,"sport":0,"nutrition":0},"user_rejected":false,"confidence":0.0}\n\n' ||
             E'ПРИМЕРЫ (только JSON в ответе):\n' ||
             E'Запрос: "Как улучшить твою архитектуру?"\n' ||
-            E'Ответ: {"room_weights":{"open_dialogue":0,"agent_dev":100,"goals_projects":0,"finance":0,"digital_world":0,"sport":0,"nutrition":0},"user_rejected":false}',
+            E'Ответ: {"room_weights":{"open_dialogue":0,"agent_dev":100,"goals_projects":0,"finance":0,"digital_world":0,"sport":0,"nutrition":0},"user_rejected":false,"confidence":0.95}\n\n' ||
+            E'Запрос: "Может про финансы поговорим?"\n' ||
+            E'Ответ: {"room_weights":{"open_dialogue":20,"agent_dev":0,"goals_projects":0,"finance":80,"digital_world":0,"sport":0,"nutrition":0},"user_rejected":true,"confidence":0.85}',
             'Промпт предразбора вопроса пользователя с классификацией комнат диалогов.',
             'internal'::prompt_type,
             v_destination_id,
