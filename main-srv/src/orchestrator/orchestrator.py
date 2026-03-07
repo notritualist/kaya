@@ -24,7 +24,7 @@ main-srv/src/orchestrator/orchestrator.py
     start_orchestrator()  # Запускает фоновый поток
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Оркестратор задач AGI-системы Kaya"
 
 import threading
@@ -39,6 +39,7 @@ from services.service_metrics import (
     mark_task_running,
     complete_task_error
 )
+from orchestrator.preprocessor import preprocess_user_message
 
 # Логгер модуля — подхватит настройки из main.py (файл + консоль, уровни)
 logger = logging.getLogger(__name__)
@@ -52,6 +53,10 @@ _running: bool = False
 
 # Флаги занятости для задач с ограниченным параллелизмом
 # (например, генерация ответа — не запускать 10 одновременно, чтобы не перегрузить модель)
+# Ограничиваем параллелизм предразбора (чтобы не перегрузить модель)
+_preprocessor_busy: bool = False
+_preprocessor_lock: threading.Lock = threading.Lock()
+# Ограничиваем параллелизм финальных генераций
 _composer_busy: bool = False
 _composer_lock: threading.Lock = threading.Lock()
 
@@ -143,6 +148,28 @@ def _get_pending_task(db_config: dict, task_type_name: str) -> RealDictCursor | 
             """, (task_type_name,))
             return cur.fetchone()
 
+def _handle_question_preprocessing(task_id: str, input_data: dict) -> None:
+    """
+    Обработчик задачи предразбора вопроса пользователя.
+    """
+    global _preprocessor_busy
+    
+    try:
+        logger.debug(f"🔍 Запуск предразбора для задачи {task_id[:8]}...")
+        preprocess_user_message(task_id=task_id, input_data=input_data)
+        
+    except Exception as exc:
+        logger.exception(
+            f"❌ Ошибка в preprocessor (task_id={task_id[:8]}...): {exc}"
+        )
+        complete_task_error(
+            task_id=task_id,
+            error_module="preprocessor",
+            error_message=str(exc)
+        )
+    finally:
+        with _preprocessor_lock:
+            _preprocessor_busy = False
 
 def _handle_answer_generation(task_id: str, input_data: dict) -> None:
     """
@@ -187,14 +214,14 @@ def _orchestrator_loop() -> None:
     Работает в фоновом потоке, запускается через start_orchestrator().
     
     Цикл:
-    1. Проверяет очередь задач типа 'user_answer_generation'
+    1. Проверяет очередь задач типа 'user_question_preprocessing', 'user_answer_generation'
     2. Если задача есть и обработчик свободен — запускает её в потоке
     3. Ждёт CHECK_INTERVAL секунд и повторяет
     4. При любой ошибке — логирует и продолжает работу (устойчивость к сбоям)
     
     Остановка: при установке _running = False (через stop_orchestrator())
     """
-    global _composer_busy, _running
+    global _preprocessor_busy, _composer_busy, _running
     
     # Загружаем конфиг БД один раз при старте цикла
     db_config: dict = load_postgres_config()
@@ -202,10 +229,35 @@ def _orchestrator_loop() -> None:
     
     while _running:
         try:
-            # === Обработка задач генерации ответа (с ограничением параллелизма) ===
-            # Проверяем, свободен ли обработчик ответов
+            # === Обработка задач ПРЕДРАЗБОРА (приоритет 0.7) ===
+            if not _preprocessor_busy:
+                task = _get_pending_task(
+                    db_config=db_config,
+                    task_type_name="user_question_preprocessing"
+                )
+                
+                if task:
+                    task_id: str = task["id"]
+                    input_data: dict = task["input_data"]
+                    
+                    mark_task_running(task_id=task_id)
+                    
+                    with _preprocessor_lock:
+                        _preprocessor_busy = True
+                    
+                    threading.Thread(
+                        target=_handle_question_preprocessing,
+                        args=(task_id, input_data),
+                        daemon=True,
+                        name=f"Preprocessor-{task_id[:8]}"
+                    ).start()
+                    
+                    logger.debug(
+                        f"🚀 Запущена задача предразбора: {task_id[:8]}..."
+                    )
+            
+            # === Обработка задач ГЕНЕРАЦИИ ОТВЕТА (приоритет 0.8) ===
             if not _composer_busy:
-                # Пытаемся получить pending-задачу
                 task = _get_pending_task(
                     db_config=db_config,
                     task_type_name="user_answer_generation"
@@ -215,35 +267,26 @@ def _orchestrator_loop() -> None:
                     task_id: str = task["id"]
                     input_data: dict = task["input_data"]
                     
-                    # Помечаем задачу как выполняющуюся в БД
                     mark_task_running(task_id=task_id)
                     
-                    # Блокируем обработчик для других потоков
                     with _composer_lock:
                         _composer_busy = True
                     
-                    # Запускаем обработку в фоновом потоке
                     threading.Thread(
                         target=_handle_answer_generation,
                         args=(task_id, input_data),
-                        daemon=True,  # Поток завершится автоматически при выходе из приложения
-                        name=f"Composer-{task_id[:8]}"  # Имя потока для отладки в логах
+                        daemon=True,
+                        name=f"Composer-{task_id[:8]}"
                     ).start()
                     
-                    logger.debug("🚀 Запущена задача генерации: %s...", task_id[:8])
+                    logger.debug(
+                        f"🚀 Запущена задача генерации: {task_id[:8]}..."
+                    )
             
-            # === Здесь можно добавить обработку других типов задач ===
-            # Пример для предразбора (без ограничения параллелизма):
-            # task = _get_pending_task(db_config, "user_question_preprocessing")
-            # if task:
-            #     threading.Thread(target=_handle_preprocessing, args=(task["id"], task["input_data"]), daemon=True).start()
-            
-            # Пауза перед следующей итерацией цикла
             time.sleep(CHECK_INTERVAL)
             
         except Exception as exc:
-            # Логируем ошибку, но не останавливаем цикл — устойчивость к сбоям
-            logger.exception("❌ Ошибка в цикле оркестратора: %s", exc)
+            logger.exception(f"❌ Ошибка в цикле оркестратора: {exc}")
             time.sleep(CHECK_INTERVAL)
 
 
