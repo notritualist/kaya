@@ -178,6 +178,9 @@ def run_console_interface(db_config: dict, kaya_version: str):
 
                 # 6.6: Заменяем статус на ответ
                 if kaya_response:
+                    from session_services.room_switch_manager import get_current_room_name
+                    current_room = get_current_room_name(db_config, session_service.session_id)
+                    print(f"\n📍 [Комната: {current_room}]", flush=True)
                     print(f"\r{' ' * len(status_text)}\r🤖 Кая: {kaya_response}\n", end="", flush=True)
                     logger.info("Ответ агента получен: %d симв.", len(kaya_response))
                 else:

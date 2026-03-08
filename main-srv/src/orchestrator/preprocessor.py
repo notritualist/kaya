@@ -7,14 +7,12 @@ main-srv/src/orchestrator/preprocessor.py
 - Определяет веса комнат диалогов (какая тема ближе)
 - Определяет, хочет ли пользователь явно сменить комнату
 - Сохраняет результаты в orchestrator.preprocessed_results
-- Обновляет dialogs.messages.processed_text
 
 Схема БД: миграции V001, V002
 Таблицы: 
 - orchestrator.prompts (промпт предразбора)
 - orchestrator.orchestrator_steps (шаг обработки)
 - orchestrator.preprocessed_results (результат предразбора)
-- dialogs.messages (обновление processed_text)
 - metrics.llm_internal (метрики LLM-запроса)
 """
 version = "1.1.0"
@@ -42,6 +40,8 @@ from services.service_metrics import (
     complete_task_error,        # Завершить задачу с ошибкой
     save_llm_metrics,           # Сохранить метрики LLM-запроса
 )
+# Сервис переключения комнат
+from session_services.room_switch_manager import process_room_switch_decision
 
 # Единая версия проекта — как в main.py
 from version import __version__ as kaya_version
@@ -56,58 +56,54 @@ logger = logging.getLogger(__name__)
 
 def parse_room_weights_json(raw_text: str) -> Optional[Dict[str, Any]]:
     """
-    Парсит JSON-ответ от модели с весами комнат.
-    
-    Args:
-        raw_text (str): Сырой ответ от модели
-        
-    Returns:
-        dict | None: Распарсенный JSON или None при ошибке
+    Парсит JSON-ответ: {"room_weights": {...}, "confidence": float, "explicit_request": bool}
     """
     if not raw_text or not isinstance(raw_text, str):
-        logger.warning("Пустой или некорректный ответ от модели")
         return None
     
-    start_idx = raw_text.find('{')
-    end_idx = raw_text.rfind('}')
+    # Очищаем от markdown
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"): cleaned = cleaned[7:]
+    if cleaned.endswith("```"): cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
     
+    start_idx = cleaned.find('{')
+    end_idx = cleaned.rfind('}')
     if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
-        logger.error(f"Не найдены фигурные скобки в ответе: {raw_text[:100]}")
+        logger.error(f"Не найдены скобки: {cleaned[:100]}")
         return None
     
-    json_str = raw_text[start_idx:end_idx + 1]
+    json_str = cleaned[start_idx:end_idx + 1]
     
     try:
         parsed = json.loads(json_str)
         
         if not isinstance(parsed, dict):
-            logger.error("JSON не является объектом")
             return None
         
-        if 'room_weights' not in parsed:
-            logger.error("Отсутствует поле 'room_weights' в JSON")
+        # Проверка обязательных полей
+        required_fields = ['room_weights', 'confidence', 'explicit_request']
+        missing = [f for f in required_fields if f not in parsed]
+        if missing:
+            logger.error(f"Нет полей: {missing}. Получено: {list(parsed.keys())}")
             return None
         
-        if 'user_rejected' not in parsed:
-            logger.error("Отсутствует поле 'user_rejected' в JSON")
+        # Валидация confidence
+        conf = parsed['confidence']
+        if not isinstance(conf, (int, float)) or conf < 0.0 or conf > 1.0:
+            logger.error(f"confidence должен быть 0.0–1.0, получено: {conf}")
             return None
         
-        # === НОВОЕ: Проверяем confidence ===
-        if 'confidence' not in parsed:
-            logger.error("Отсутствует поле 'confidence' в JSON")
+        # Валидация explicit_request
+        explicit = parsed['explicit_request']
+        if not isinstance(explicit, bool):
+            logger.error(f"explicit_request должен быть bool, получено: {explicit}")
             return None
         
-        # Валидируем диапазон confidence (0.0–1.0)
-        confidence = parsed.get('confidence', 0.0)
-        if not isinstance(confidence, (int, float)) or confidence < 0.0 or confidence > 1.0:
-            logger.error(f"confidence должен быть числом от 0.0 до 1.0, получено: {confidence}")
-            return None
-        
-        logger.debug("✅ JSON успешно распарсен")
         return parsed
         
     except json.JSONDecodeError as e:
-        logger.error(f"❌ Ошибка парсинга JSON: {e}")
+        logger.error(f"JSON error: {e}")
         return None
 
 
@@ -156,7 +152,7 @@ def get_preprocessing_prompt(db_config: dict) -> Optional[Dict[str, Any]]:
 
 def get_user_message_data(db_config: dict, message_id: str) -> Optional[Dict[str, Any]]:
     """
-    Получает данные сообщения пользователя из БД.
+    Получает данные сообщения пользователя из БД и имя текущей комнаты.
     
     Args:
         db_config (dict): Параметры подключения к PostgreSQL
@@ -171,9 +167,12 @@ def get_user_message_data(db_config: dict, message_id: str) -> Optional[Dict[str
                 cur.execute("""
                     SELECT 
                         m.id, m.row_text, m.session_id, m.room_id, m.actor_id,
-                        s.current_room, s.actor_external_id
+                        s.current_room,
+                        cr.name AS current_room_name,
+                        s.actor_external_id
                     FROM dialogs.messages m
                     JOIN dialogs.sessions s ON s.id = m.session_id
+                    LEFT JOIN dialogs.rooms cr ON cr.id = s.current_room
                     WHERE m.id = %s
                 """, (message_id,))
                 
@@ -207,7 +206,7 @@ def save_preprocessed_result(
     Args:
         db_config (dict): Параметры подключения к PostgreSQL
         message_id (str): UUID исходного сообщения
-        preprocessed_data (dict): Результат анализа (веса комнат, user_rejected)
+        preprocessed_data (dict): Результат анализа (веса комнат)
         llm_metric_id (str): UUID метрик LLM-запроса
         
     Returns:
@@ -250,21 +249,19 @@ def save_preprocessed_result(
         return None
 
 
-def update_message_processed_text(
+def update_message_preprocessed_result(
     db_config: dict,
     message_id: str,
-    processed_text: str,
     preprocess_result_id: str,
     llm_metric_id: str,
     orchestrator_step_id: str
 ) -> bool:
     """
-    Обновляет сообщение пользователя: processed_text + ссылки на метрики.
+    Обновляет сообщение пользователя: ссылки на метрики.
     
     Args:
         db_config (dict): Параметры подключения к PostgreSQL
         message_id (str): UUID сообщения
-        processed_text (str): Нормализованный текст (пока = row_text)
         preprocess_result_id (str): UUID результата предразбора
         llm_metric_id (str): UUID метрик LLM
         
@@ -277,13 +274,11 @@ def update_message_processed_text(
                 cur.execute("""
                     UPDATE dialogs.messages
                     SET 
-                        processed_text = %s,
                         preprocess_result_id = %s,
                         llm_metric_id = %s,
                         orchestrator_step_id = %s
                     WHERE id = %s
                 """, (
-                    processed_text,
                     preprocess_result_id,
                     llm_metric_id,
                     orchestrator_step_id,
@@ -293,7 +288,7 @@ def update_message_processed_text(
                 
                 logger.debug(
                     f"✅ Сообщение {message_id[:8]} обновлено: "
-                    f"processed_text + ссылки на метрики"
+                    f"ссылки на метрики"
                 )
                 return True
                 
@@ -318,7 +313,7 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
     5. Вызвать ModelService.generate()
     6. Распарсить JSON с весами комнат
     7. Сохранить результат в preprocessed_results
-    8. Обновить dialogs.messages (processed_text, метрики)
+    8. Обновить dialogs.messages (метрики)
     9. Создать задачу генерации ответа (user_answer_generation)
     10. Завершить текущую задачу и шаг
     """
@@ -356,7 +351,9 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
     user_content: str = msg_data["row_text"]
     session_id: str = msg_data["session_id"]
     current_room: str = msg_data["current_room"]
-    
+    current_room_name = msg_data.get("current_room_name") or "unknown" 
+    user_actor_id: str = msg_data.get("actor_id")
+
     # === ШАГ 2: Получаем промпт предразбора ===
     prompt_data = get_preprocessing_prompt(db_config)
     if not prompt_data:
@@ -374,24 +371,73 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
     model_params: Dict[str, Any] = prompt_data["params"] or {}
     
     # === ШАГ 3: Создаём шаг оркестратора ===
+    # Получаем ID истории сообщений (ДО создания шага)
+    history_ids = []
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id FROM dialogs.messages
+                WHERE session_id = %s AND actor_id = %s AND id != %s
+                ORDER BY timestamp DESC LIMIT 2
+            """, (session_id, user_actor_id, message_id))
+            history_ids = [str(row["id"]) for row in reversed(cur.fetchall())]
+
     step_input = {
         "message_id": message_id,
         "prompt_id": prompt_id,
         "session_id": session_id,
-        "current_room": current_room
+        "current_room": current_room,
+        "history_message_ids": history_ids  # ← НОВОЕ
     }
-    
+
     step_id = create_orchestrator_step(
         task_id=task_id,
         step_number=1,
         step_type_name="user_question_preprocessing",
         input_data=step_input
     )
-    logger.info(f"✅ Шаг предразбора создан: {step_id[:8]}")
+    
+    # === ЛОГИРОВАНИЕ: что подставляем в промпт ===
+    logger.info(
+        f"📝 Промпт предразбора: текущая_комната='{current_room_name}', "
+        f"история_сообщений={len(history_ids)} шт. ({', '.join([id[:8] for id in history_ids])})"
+    )
     
     # === ШАГ 4: Формируем messages для LLM ===
+    # 4.1: Получаем историю сообщений (2 последних + текущее)
+    from session_services.room_switch_manager import get_user_message_history, get_rooms_descriptions
+
+    history_list = get_user_message_history(
+    db_config=db_config,
+    session_id=session_id,
+    user_actor_id=user_actor_id,
+    current_message_id=message_id,
+    limit=2
+    )
+
+    # 4.2 Форматируем историю для промпта
+    history_text = ""
+    for i, msg_text in enumerate(history_list, 1):
+        history_text += f"{i}. {msg_text}\n"
+    history_text += f"{len(history_list)+1}. {user_content}  ← текущее"
+
+    # === ЛОГИРОВАНИЕ: история диалога ===
+    logger.debug(f"📜 История диалога:\n{history_text}")
+
+    # 4.3: Получаем описания комнат из БД
+    rooms_descriptions = get_rooms_descriptions(db_config)
+
+    # 4.4: Подставляем в промпт динамические значения
+    system_prompt_filled = system_prompt.replace("{{current_room}}", current_room_name or "unknown")
+    system_prompt_filled = system_prompt_filled.replace("{{history}}", history_text)
+    system_prompt_filled = system_prompt_filled.replace("{{rooms_descriptions}}", rooms_descriptions)
+
+    # === ЛОГИРОВАНИЕ: финальный промпт (первые 500 симв.) ===
+    logger.debug(f"🔍 Промпт после подстановки (1000 симв.):\n{system_prompt_filled[:1000]}...")
+
+    # 4.5: Формируем messages
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": system_prompt_filled},
         {"role": "user", "content": user_content}
     ]
     
@@ -448,25 +494,25 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
     
     # === ШАГ 7: Парсим JSON-ответ ===
     raw_response: str = result["response"]
-    logger.debug(f"Сырой ответ модели: {raw_response[:200]}...")
-    
+    logger.debug(f"🔍 RAW RESPONSE: {raw_response}")
+    logger.debug(f"🔍 Длина ответа: {len(raw_response)}")
+
     parsed_data = parse_room_weights_json(raw_response)
-    
+
     if not parsed_data:
-        # === ОШИБКА: не удалось распарсить → завершаем задачу с ошибкой ===
         error = "Не удалось распарсить JSON-ответ модели с весами комнат"
         logger.error(f"❌ {error}")
-        complete_step_error(
-            step_id=step_id,
-            error_module="preprocessor",
-            error_message=error
-        )
-        complete_task_error(
-            task_id=task_id,
-            error_module="preprocessor",
-            error_message=error
-        )
+        complete_step_error(step_id=step_id, error_module="preprocessor", error_message=error)
+        complete_task_error(task_id=task_id, error_module="preprocessor", error_message=error)
         return
+
+    # === Логируем результат предразбора ===
+    logger.info(
+        f"📊 Результат предразбора: "
+        f"room_weights={parsed_data.get('room_weights')}, "
+        f"confidence={parsed_data.get('confidence')}, "
+        f"explicit_request={parsed_data.get('explicit_request')}"
+    )
     
     # === ШАГ 8: Сохраняем метрики LLM ===
     metrics: Dict[str, Any] = result["metrics"]
@@ -505,17 +551,32 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
         logger.error("⚠️ Не удалось сохранить результат предразбора, продолжаем...")
     
     # === ШАГ 10: Обновляем сообщение пользователя ===
-    update_success = update_message_processed_text(
+    update_success = update_message_preprocessed_result(
         db_config=db_config,
         message_id=message_id,
-        processed_text=user_content,
         preprocess_result_id=preprocess_result_id or "",
         llm_metric_id=llm_metric_id,
         orchestrator_step_id=step_id 
     )
     
     if not update_success:
-        logger.warning("⚠️ Не удалось обновить processed_text в сообщении")
+        logger.warning("⚠️ Не удалось обновить метрики в сообщении")
+
+    # === ШАГ 10.1: Обрабатываем решение о переключении комнаты ===
+    # Вызов СИНХРОНИЗИРОВАН с room_switch_manager.process_room_switch_decision()
+    from session_services.room_switch_manager import process_room_switch_decision
+
+    switched, new_room_id, room_name = process_room_switch_decision(
+        message_id=message_id,
+        session_id=session_id,
+        preprocess_result=parsed_data,
+        orchestrator_step_id=step_id
+    )
+
+    if switched:
+        logger.info(f"🔄 Комната переключена на: {room_name}")
+    else:
+        logger.debug(f"📍 Оставляем текущую комнату: {room_name}")  
     
     # === ШАГ 11: Создаём задачу генерации ответа (приоритет 0.8) ===
     try:
@@ -560,7 +621,10 @@ def preprocess_user_message(task_id: str, input_data: Dict[str, Any]) -> None:
     # === ШАГ 12: Завершаем шаг и задачу предразбора ===
     step_output = {
         "preprocess_result_id": preprocess_result_id,
-        "llm_metric_id": llm_metric_id
+        "llm_metric_id": llm_metric_id,
+        "room_weights": parsed_data.get("room_weights", {}),
+        "confidence": parsed_data.get("confidence", 0.0),
+        "explicit_request": parsed_data.get("explicit_request", False)  # ← НОВОЕ
     }
 
     complete_step_success(step_id=step_id, output_data=step_output)

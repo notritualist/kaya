@@ -91,10 +91,15 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                 logger.error(error)
                 complete_task_error(task_id, error_module="response_composer", error_message=error)
                 return
+            
             user_content: str = msg["row_text"]
             session_id: str = msg["session_id"]
-            room_id: str = msg["room_id"]
-            user_actor_id: str = msg["actor_id"]  # ← НОВОЕ: ID актора пользователя
+            room_id: str = msg["room_id"]  # Физическая комната (аудит)
+            user_actor_id: str = msg["actor_id"]
+                        
+            logger.debug(
+                f"📍 Комната: физическая={room_id[:8]}"
+            )
     
     # === 2. Получаем промпт и параметры генерации ===
     with psycopg2.connect(**db_config) as conn:
@@ -121,10 +126,16 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     # === 3. Формируем messages для API ===
     # 3.1: Собираем контекст: история сессии + (потом) векторный поиск
     context_messages, context_message_ids = build_context(
-        session_id=session_id,      # ← сессия
-        user_actor_id=user_actor_id,  # ← НОВОЕ: вместо session_id
+        session_id=session_id,
+        user_actor_id=user_actor_id,
         current_message_id=message_id,
         current_message_text=user_content
+    )
+
+    # === ЛОГИРОВАНИЕ: какие ID пошли в контекст ===
+    logger.info(
+        f"📝 Контекст для генерации: {len(context_message_ids)} сообщений "
+        f"({', '.join([id[:8] for id in context_message_ids])})"
     )
     
     # 3.2: Формируем messages
@@ -176,15 +187,18 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         "prompt_id": prompt_id,
         "context_message_ids": context_message_ids
     }
-    
+
     step_id = create_orchestrator_step(
         task_id=task_id,
         step_number=1,
         step_type_name="user_answer_generation",
         input_data=step_input
     )
-    logger.info("✅ Шаг %s создан: контекст=%d сообщений, токенов=%d", 
-               step_id[:8], len(context_message_ids), total_input_tokens)
+
+    logger.info(
+        f"✅ Шаг {step_id[:8]} создан: контекст={len(context_message_ids)} сообщений, "
+        f"токенов={total_input_tokens}"
+    )
     
     # 4. Вызов модели
     logger.debug("Вызов ModelService.generate: %d элементов в истории messages", len(messages))
@@ -266,7 +280,6 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     try:
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor() as cur:
-                # Получаем ID актора системы (Кая)
                 cur.execute("""
                     SELECT id FROM users.actors WHERE type = 'system'::actor_type LIMIT 1
                 """)
@@ -275,10 +288,8 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                     raise RuntimeError("Актор 'system' не найден")
                 system_actor_id: str = system_actor[0]
                 
-                # Считаем токены чистого ответа (для статистики)
                 token_count: int = count_tokens_qwen(clean_response)
                 
-                # Вставляем ответ с parent_message_id = сообщение пользователя
                 cur.execute("""
                     INSERT INTO dialogs.messages (
                         parent_message_id,
@@ -286,7 +297,6 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                         actor_type,
                         session_id,
                         room_id,
-                        effective_room_id,
                         row_text,
                         token_count,
                         answer_latency,
@@ -294,16 +304,15 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                         timestamp,
                         orchestrator_step_id,
                         llm_metric_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
-                    message_id,              # ← parent = сообщение пользователя
+                    message_id,
                     system_actor_id,
                     "system",
                     session_id,
-                    room_id,
-                    room_id,                 # ← effective_room_id = room_id по умолчанию
-                    clean_response,          # ← БЕЗ <think>, только чистый ответ
+                    room_id,          # ← Физическая комната = актуальная
+                    clean_response,
                     token_count,
                     answer_latency,
                     kaya_version,
@@ -311,11 +320,11 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                     step_id,
                     llm_metric_id
                 ))
-                response_message_id = str(cur.fetchone()[0])  # ← СОХРАНЯЕМ ID
+                response_message_id = str(cur.fetchone()[0])
                 conn.commit()
                 logger.info(
-                    "✅ Ответ сохранён: parent=%s..., ответ=%s..., чистый=%d симв., токены=%d ",
-                    message_id[:8], response_message_id[:8], len(clean_response), token_count
+                    "✅ Ответ сохранён: parent=%s..., ответ=%s..., комната=%s...",
+                    message_id[:8], response_message_id[:8], room_id[:8]
                 )
                 
     except Exception as e:
