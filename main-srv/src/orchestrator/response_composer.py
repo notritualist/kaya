@@ -201,7 +201,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     )
     
     # 4. Вызов модели
-    logger.debug("Вызов ModelService.generate: %d элементов в истории messages", len(messages))
+    logger.debug("Вызов ModelService.generate: %d элементов история messages + системный промпт + текущее сообщение", len(messages))
     model = ModelService()
     result = model.generate(
         messages=messages,
