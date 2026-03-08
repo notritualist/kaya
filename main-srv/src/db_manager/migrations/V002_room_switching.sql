@@ -8,12 +8,12 @@
 -- Блок 1: ENUM для типов триггеров переключения комнат
 -- ============================================================================
 DO $$ BEGIN
-IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'room_switch_trigger_type') THEN
-CREATE TYPE room_switch_trigger_type AS ENUM (
-    'explicit_user_request',      -- Пользователь запросил переход в комнату
-    'auto_high_confidence'       -- Авто-переключение по высокой уверенности модели (>=CONFIDENCE_THRESHOLD_AUTO_SWITCH)
-);
-END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'room_switch_trigger_type') THEN
+        CREATE TYPE room_switch_trigger_type AS ENUM (
+            'explicit_user_request',      -- Пользователь запросил переход в комнату
+            'auto_high_confidence'        -- Авто-переключение по высокой уверенности модели (>=CONFIDENCE_THRESHOLD_AUTO_SWITCH)
+        );
+    END IF;
 END $$;
 COMMENT ON TYPE room_switch_trigger_type IS 'Типы триггеров переключения комнат';
 
@@ -27,7 +27,10 @@ DO $$ BEGIN
         CREATE TYPE reclassification_type AS ENUM (
             'internal_model',     -- Внутренняя модель
             'external_model'      -- Внешняя модель  
-
+        );
+    END IF;
+END $$;
+COMMENT ON TYPE reclassification_type IS 'Тип модели реклассификации внутренняя/внешняя';
 
 -- ============================================================================
 -- Блок 3: Добавляем effective_room_id и reclassification_step_id в messages
@@ -226,8 +229,8 @@ SELECT
     mr.model_name,
     mr.reclassification_type,
     CASE 
-        WHEN mr.reclassification_type = 'internal' THEN 'Внутренняя модель'
-        WHEN mr.reclassification_type = 'external' THEN 'Внешняя модель'
+        WHEN mr.reclassification_type = 'internal_model' THEN 'Внутренняя модель'
+        WHEN mr.reclassification_type = 'external_model' THEN 'Внешняя модель'
     END AS reclassification_type_text
 FROM dialogs.messages_rooms_reclassifications mr
 JOIN dialogs.messages m ON m.id = mr.message_id
