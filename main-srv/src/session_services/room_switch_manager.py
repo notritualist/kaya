@@ -37,9 +37,9 @@ description = "Менеджер переключения комнат диало
 # =============================================================================
 
 # Порог уверенности для авто-переключения (0.0–1.0)
-CONFIDENCE_THRESHOLD_AUTO_SWITCH: float = 0.85
+CONFIDENCE_THRESHOLD_AUTO_SWITCH: float = 1.2 # Отключил для тестирования диалогов
 
-# Минимальный вес комнаты для переключения (0–100)
+# Минимальный вес комнаты для переключения (0–100) в том числе по запрсосу пользователя
 MIN_ROOM_WEIGHT_THRESHOLD: int = 70
 
 # =============================================================================
@@ -49,7 +49,6 @@ MIN_ROOM_WEIGHT_THRESHOLD: int = 70
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
-from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 from db_manager.db_manager import load_postgres_config
 from version import __version__ as kaya_version

@@ -8,17 +8,20 @@ kaya/
 │
 ├── db-srv/                      # 🗄️ Сервис базы данных
 │   ├── configs/
-│   │   ├── docker-compose.yaml  # Docker Compose для PostgreSQL
+│   │   ├── docker-compose.yaml  # Docker Compose для PostgreSQL и Qdrant
 │   │   ├── postgresql.conf      # Конфигурация PostgreSQL
-│   │   └── pg_hba.conf          # Правила аутентификации
+│   │   ├── pg_hba.conf          # Правила аутентификации
+│   │   └── qdrant_config.yaml   # Конфигурация Qdrant
 │   └── scripts/
-│       └── start-db.sh          # Скрипт запуска БД
+│       ├── start-db.sh          # Скрипт запуска БД
+│       └── create_qdrant_collection.py # Создание коллекции kaya_db
 │
 ├── main-srv/                    # 🖥️ Основной сервер
 │   ├── .venv/                   # Виртуальное окружение Python
 │   ├── configs/
 │   │   ├── model_config.yaml    # Конфигурация модели
-│   │   └── postgres_config.yaml # Конфигурация подключения к БД
+│   │   ├── postgres_config.yaml # Конфигурация подключения к БД
+│   │   └── qdrant_config.yaml   # Конфигурация подключения к Qdrant
 │   │
 │   ├── llama.cpp/               # ⚙️ Субмодуль llama.cpp (форк)
 │   │   ├── CMakeLists.txt

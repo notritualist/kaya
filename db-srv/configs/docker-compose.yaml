@@ -1,5 +1,4 @@
 # /mnt/work/kaya/main-srv/db-srv/configs/docker-compose.yml
-# docker-compose.yml version: 1.0.0
 
 services:
   postgres_db:
@@ -23,6 +22,18 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
+
+  qdrant: 
+    image: qdrant/qdrant:latest 
+    container_name: qdrant_db
+    restart: unless-stopped 
+    volumes: 
+      - /mnt/data_bases/qdrant_data:/qdrant/storage 
+      - /mnt/data_bases/qdrant_snapshots:/qdrant/snapshots
+      - /mnt/work/kaya/db-srv/configs/qdrant_config.yaml:/qdrant/config/production.yaml 
+    ports: 
+      - "6333:6333" 
+      - "6334:6334" 
 
 volumes:
   postgres_nvme_data:
