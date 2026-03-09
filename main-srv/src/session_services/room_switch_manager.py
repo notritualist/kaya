@@ -25,7 +25,7 @@ main-srv/src/session_services/room_switch_manager.py
 Логика принятия решений:
     1. Если лучшая комната == текущая → оставляем
     2. Явный запрос + вес комнаты >= 80 → переключаем сразу
-    3. Авто-переключение: confidence >= 0.85 + вес комнаты >= 80 → переключаем
+    3. Авто-переключение: confidence >= 0.85 + вес комнаты >= 80 → переключаем (если разрешено)
     4. Иначе → не переключаем
 """
 
@@ -37,10 +37,13 @@ description = "Менеджер переключения комнат диало
 # =============================================================================
 
 # Порог уверенности для авто-переключения (0.0–1.0)
-CONFIDENCE_THRESHOLD_AUTO_SWITCH: float = 1.2 # Отключил для тестирования диалогов
+CONFIDENCE_THRESHOLD_AUTO_SWITCH: float = 0.9
 
 # Минимальный вес комнаты для переключения (0–100) в том числе по запрсосу пользователя
 MIN_ROOM_WEIGHT_THRESHOLD: int = 70
+
+# Разрешить авто-переключение комнат (без явного запроса пользователя)
+AUTO_SWITCH_ENABLED: bool = False  # False = только явные запросы, True = разрешить авто-переключение
 
 # =============================================================================
 # === ИМПОРТЫ =================================================================
@@ -236,8 +239,8 @@ def process_room_switch_decision(
     
     Логика:
     1. best_room == current_room → оставляем
-    2. explicit_request + вес >= 80 → переключаем сразу
-    3. !explicit_request + уверенность >= 0.85 + вес >= 80 → переключаем
+    2. explicit_request + вес >= 80 → переключаем сразу (работает всегда)
+    3. !explicit_request + уверенность >= 0.85 + вес >= 80 → переключаем (только если AUTO_SWITCH_ENABLED=True)
     4. иначе → не переключаем
     """
     db_config = load_postgres_config()
@@ -273,7 +276,7 @@ def process_room_switch_decision(
         logger.info(f"✅ Оставляем текущую комнату: {current_room_name}")
         return False, None, current_room_name
     
-    # === ПРОВЕРКА 2: Явный запрос + вес >= порога → сразу ===
+    # === ПРОВЕРКА 2: Явный запрос + вес >= порога → сразу (работает независимо от AUTO_SWITCH_ENABLED) ===
     if explicit_request and best_room_weight >= MIN_ROOM_WEIGHT_THRESHOLD:
         logger.info(f"🚀 ЯВНЫЙ ЗАПРОС: {current_room_name} → {best_room_name}")
         return _execute_switch(
@@ -281,8 +284,8 @@ def process_room_switch_decision(
             best_room_name, "explicit_user_request", confidence, room_weights
         )
     
-    # === ПРОВЕРКА 3: Авто-переключение (оба порога) ===
-    if confidence >= CONFIDENCE_THRESHOLD_AUTO_SWITCH and best_room_weight >= MIN_ROOM_WEIGHT_THRESHOLD:
+    # === ПРОВЕРКА 3: Авто-переключение (только если разрешено константой) ===
+    if AUTO_SWITCH_ENABLED and confidence >= CONFIDENCE_THRESHOLD_AUTO_SWITCH and best_room_weight >= MIN_ROOM_WEIGHT_THRESHOLD:
         logger.info(f"🚀 АВТО-ПЕРЕКЛЮЧЕНИЕ: {current_room_name} → {best_room_name}")
         return _execute_switch(
             db_config, message_id, session_id, current_room_id, current_room_name,
@@ -290,7 +293,7 @@ def process_room_switch_decision(
         )
     
     # === НЕ ПРОШЛИ → не переключаем ===
-    logger.info(f"⛔ БЛОК: явный={explicit_request}, вес={best_room_weight}, conf={confidence}")
+    logger.info(f"⛔ БЛОК: явный={explicit_request}, вес={best_room_weight}, conf={confidence}, auto_switch_enabled={AUTO_SWITCH_ENABLED}")
     return False, None, current_room_name
 
 
