@@ -1,6 +1,6 @@
 """/main-srv/src/main.py"""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Главный модуль запуска Каи"
 
 
@@ -8,7 +8,7 @@ import sys
 import logging
 from pathlib import Path
 from version import __version__ as kaya_version # Версия проекта
-from db_manager.db_manager import load_postgres_config, ensure_schema_ready
+from db_manager.db_manager import load_postgres_config, ensure_schema_ready, load_qdrant_config, ensure_qdrant_collections
 from interfaces.console_interface import run_console_interface
 from orchestrator.orchestrator import start_orchestrator
 from session_services.session_manager import SessionManager
@@ -51,12 +51,12 @@ def main():
     Точка входа проекта.
     Последовательность:
     1. Логгирование старта агента
-    2. Загрузка и проверка схемы БД 
-    3. Очистка зависших после рестарта сессий диалогов пользователей
-    3. Запустить цикл оркестратора
-    4. Запуск консольного интерфейса с управлением сессией
+    2. Загрузка и проверка схемы БД Postgres 
+    3. Загрузка и проверка коллекции Qdrant
+    4. Очистка зависших после рестарта сессий диалогов пользователей
+    5. Запустить цикл оркестратора
+    6. Запуск консольного интерфейса с управлением сессией
     """
-
     # Инициализация логгирования
     success = False
     logger = setup_logging()
@@ -72,13 +72,21 @@ def main():
             return 1
         success = True 
         
-        # 3. Очистка зависших до рестарта сессий
+        # 3. Убеждаемся, что коллекция Qdrant существует и доступна
+        qdrant_config = load_qdrant_config()
+        if not ensure_qdrant_collections(qdrant_config):
+            logger.critical(f"Инициализация векторной базы данных Qdrant не удалась")
+            return 1
+        
+        success = True 
+        
+        # 4. Очистка зависших до рестарта сессий
         SessionManager.close_dangling_sessions(postgres_config)
         
-        # 3. Запустить цикл оркестратора
+        # 5. Запустить цикл оркестратора
         start_orchestrator()
 
-        # 4. Запустить консольный интерфейс с передачей конфига БД и версии агента
+        # 6. Запустить консольный интерфейс с передачей конфига БД и версии агента
         run_console_interface(postgres_config, kaya_version)
 
     except Exception as e:
