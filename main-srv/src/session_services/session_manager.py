@@ -425,7 +425,6 @@ class SessionManager:
                     actor_type, 
                     session_id, 
                     room_id,
-                    effective_room_id,
                     row_text, 
                     token_count, 
                     answer_latency,
@@ -434,7 +433,7 @@ class SessionManager:
                     orchestrator_step_id,
                     llm_metric_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, params=(
                 parent_message_id,
@@ -442,7 +441,6 @@ class SessionManager:
                 self.actor_type,
                 self.session_id,
                 room_id,              # ← из current_room сессии
-                room_id,              # ← effective_room_id = room_id по умолчанию (V002)
                 content,
                 token_count,
                 user_think_latency,
