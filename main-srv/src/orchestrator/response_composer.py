@@ -1,17 +1,16 @@
 """
 main-srv/src/orchestrator/response_composer.py
-
 Модуль генерации финального ответа пользователю.
-
 Логика:
-1. Получить сообщение пользователя из БД
-2. Получить промпт и параметры генерации из orchestrator.prompts.params
-3. Вызвать ModelService.generate() с параметрами из промпта
-4. Обработать ответ:
-   - Извлечь <think>...</think> → сохранить в orchestrator.reasonings
-   - Очистить ответ от <think> → сохранить в dialogs.messages
-5. Записать метрики в metrics.llm_internal
-6. Завершить задачу/шаг оркестратора
+- Получить сообщение пользователя из БД
+- Получить промпт и параметры генерации из orchestrator.prompts.params
+- Вызвать ModelService.generate() с параметрами из промпта
+- Обработать ответ:
+  - Извлечь <think> → сохранить в orchestrator.reasonings
+  - Очистить ответ от <think> → сохранить в dialogs.messages
+- Записать метрики в metrics.llm_internal
+- Завершить задачу/шаг оркестратора
+- Создать ДВЕ фоновые задачи: нормализация + реклассификация
 """
 
 __version__ = "1.1.0"
@@ -24,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from orchestrator.context_builder import build_context
 from services.tokens_counter import count_tokens_qwen
+
 
 # Единая версия проекта — как в main.py
 from version import __version__ as kaya_version
@@ -335,14 +335,59 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     
     # === 11. Завершаем шаг и задачу ===
     step_output: Dict[str, Any] = {
-        "response_message_id": str(response_message_id),  # ← ID сообщения в dialogs.messages
+        "response_message_id": str(response_message_id),
         "llm_metric_id": llm_metric_id
     }
 
-    # reasoning_id добавляем только если есть (он уже в колонке steps.reasoning_id)
     if reasoning_id:
         step_output["reasoning_id"] = reasoning_id
 
     complete_step_success(step_id, output_data=step_output)
+        
+    # =============================================================================
+    # === 12. Создаём фоновую задачу на НОРМАЛИЗАЦИЮ (приоритет 0.5)
+    # =============================================================================
+    try:
+        from orchestrator.tools.messages_normalize import create_normalization_task
+        
+        normalization_task_id = create_normalization_task(
+            user_message_id=message_id,
+            system_message_id=response_message_id,
+            session_id=session_id,
+            priority=0.5
+        )
+        
+        if normalization_task_id:
+            logger.info("🔄 Задача нормализации создана: %s", normalization_task_id[:8])
+            step_output["normalization_task_id"] = normalization_task_id
+        else:
+            logger.warning("⚠️ Не удалось создать задачу нормализации")
+
+    except Exception as e:
+        logger.warning("⚠️ Ошибка при создании задачи нормализации: %s", str(e))
+
+    # =============================================================================
+    # === 13. Создаём фоновую задачу на РЕКЛАССИФИКАЦИЮ (приоритет 0.2)
+    # =============================================================================
+    try:
+        from orchestrator.tools.reclassification_rooms import create_reclassification_task
+        
+        reclassification_task_id = create_reclassification_task(
+            user_message_id=message_id,
+            system_message_id=response_message_id,
+            session_id=session_id,
+            priority=0.2
+        )
+        
+        if reclassification_task_id:
+            logger.info("🔄 Задача реклассификации создана: %s", reclassification_task_id[:8])
+            step_output["reclassification_task_id"] = reclassification_task_id
+        else:
+            logger.warning("⚠️ Не удалось создать задачу реклассификации")
+
+    except Exception as e:
+        logger.warning("⚠️ Ошибка при создании задачи реклассификации: %s", str(e))
+
+    # === 14. Завершаем задачу генерации ===
     complete_task_success(task_id, output_data=step_output)
     logger.info("✅ Задача %s... завершена успешно", task_id[:8])
