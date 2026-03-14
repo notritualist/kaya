@@ -22,8 +22,8 @@ main-srv/src/orchestrator/tools/messages_normalize.py
     "session_id": "<uuid>"
 }
 """
-version = "1.1.0"
-description = "Фоновая нормализация текста сообщений диалога"
+__version__ = "1.1.0"
+__description__ = "Фоновая нормализация текста сообщений диалога"
 
 import logging
 import psycopg2

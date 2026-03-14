@@ -15,8 +15,8 @@ main-srv/src/orchestrator/preprocessor.py
 - orchestrator.preprocessed_results (результат предразбора)
 - metrics.llm_internal (метрики LLM-запроса)
 """
-version = "1.1.0"
-description = "Предобработка сообщений пользователя для классификации комнат"
+__version__ = "1.1.0"
+__description__ = "Предобработка сообщений пользователя для классификации комнат"
 
 import logging
 import json

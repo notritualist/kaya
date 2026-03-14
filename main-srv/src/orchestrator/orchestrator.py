@@ -22,8 +22,8 @@ main-srv/src/orchestrator/orchestrator.py
     from orchestrator.orchestrator import start_orchestrator
     start_orchestrator()  # Запускает фоновый поток
 """
-version = "1.1.0"
-description = "Оркестратор задач AGI-системы Kaya"
+__version__ = "1.1.0"
+__description__ = "Оркестратор задач AGI-системы Kaya"
 
 import threading
 import time

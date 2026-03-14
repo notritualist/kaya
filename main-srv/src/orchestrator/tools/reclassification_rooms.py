@@ -22,8 +22,8 @@ main-srv/src/orchestrator/tools/reclassification_rooms.py
     "session_id": "<uuid>"
 }
 """
-version = "1.1.0"
-description = "Фоновая реклассификация сообщений по комнатам диалога"
+__version__ = "1.1.0"
+__description__ = "Фоновая реклассификация сообщений по комнатам диалога"
 
 import logging
 import psycopg2
