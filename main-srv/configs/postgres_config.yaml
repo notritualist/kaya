@@ -1,0 +1,6 @@
+database:
+  host: "localhost"
+  port: 5432
+  dbname: "kaya_db"
+  user: "kaya"
+  password: "123"
