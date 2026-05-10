@@ -20,7 +20,8 @@ kaya/
 ├── main-srv/                    # Основной сервер
 │   ├── .venv/                   # Виртуальное окружение Python
 │   ├── configs/
-│   │   └── postgres_config.yaml # Конфигурация подключения к БД PostgresSQL
+│   │   ├── postgres_config.yaml # Конфигурация подключения к БД PostgresSQL
+│   │   └── qdrant_config.yaml   # Конфигурация подключения к БД Qdrant
 │   │
 │   ├── llama.cpp/               # Субмодуль llama.cpp (форк)
 │   │   ├── CMakeLists.txt
