@@ -12,7 +12,7 @@ from typing import List, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from psycopg2.extensions import connection
-from version import __version__ as kaya_version 
+from version import __version__ as agent_version 
 
 
 # Логгер для модуля
@@ -26,13 +26,13 @@ class MigrationRecord:
     description: str
     status: str
     applied_at: datetime
-    kaya_version: str
+    agent_version: str
 
 
 class PGMigrationManager:
     def __init__(self, migrations_path: str = "migrations"):
         self.migrations_path = Path(migrations_path)
-        self.kaya_version = kaya_version
+        self.agent_version = agent_version
         
     
     def get_applied_migrations(self, conn: connection) -> List[MigrationRecord]:
@@ -40,7 +40,7 @@ class PGMigrationManager:
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT version, description, status, applied_at, kaya_version
+                SELECT version, description, status, applied_at, agent_version
                 FROM architect.schema_version 
                 WHERE status = 'applied'
                 ORDER BY version
@@ -55,7 +55,7 @@ class PGMigrationManager:
                         description=row[1],
                         status=row[2],
                         applied_at=row[3],
-                        kaya_version=row[4]
+                        agent_version=row[4]
                     ))
             return migrations
         finally:
@@ -109,9 +109,9 @@ class PGMigrationManager:
             # Записываем в журнал миграций
             cur.execute("""
                 INSERT INTO architect.schema_version 
-                (version, description, status, kaya_version)
+                (version, description, status, agent_version)
                 VALUES (%s, %s, 'applied', %s)
-            """, (version, description, self.kaya_version))
+            """, (version, description, self.agent_version))
             
             conn.commit()
             logger.info(f"Postgres DB migration applied: {version} - {description}")
@@ -190,7 +190,7 @@ class PGMigrationManager:
                     description TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    kaya_version TEXT NOT NULL
+                    agent_version TEXT NOT NULL
                 )
             """)
             
@@ -201,7 +201,7 @@ class PGMigrationManager:
             cur.execute("COMMENT ON COLUMN architect.schema_version.description IS 'Detailed description of changes made to the DB schema by this migration.'")
             cur.execute("COMMENT ON COLUMN architect.schema_version.status IS 'Current migration status: applied or rolled_back.'")
             cur.execute("COMMENT ON COLUMN architect.schema_version.applied_at IS 'Timestamp (UTC) of when the migration was applied or rolled back.'")
-            cur.execute("COMMENT ON COLUMN architect.schema_version.kaya_version IS 'Kaya version (from pyproject.toml) at migration time.'")
+            cur.execute("COMMENT ON COLUMN architect.schema_version.agent_version IS 'Agent version (from pyproject.toml) at migration time.'")
             
             conn.commit()
             logger.info("Base Postgres migration table created")

@@ -1,6 +1,6 @@
-# Kaya Project Structure
+# Project Structure
 
-kaya/
+agent/
 ├── README.md                    # Project description (EN)
 ├── README_ru.md                 # Project description (RU)
 ├── pyproject.toml               # Python project: dependencies, version

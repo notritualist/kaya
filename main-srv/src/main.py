@@ -1,14 +1,15 @@
 """/main-srv/src/main.py"""
 
-__version__ = "1.0.1"
-__description__ = "Main launch module of Kaya"
+__version__ = "1.0.2"
+__description__ = "Main launch module of agent"
 
 
 import sys
 import logging
 from pathlib import Path
-from version import __version__ as kaya_version # Версия проекта
+from version import __version__ as agent_version # Версия проекта
 from db_manager.db_manager import load_postgres_config, ensure_postgres_schema_ready, load_qdrant_config, ensure_qdrant_collections
+# from interfaces.console_interface import run_console_interface
 
 
 def setup_logging():
@@ -32,7 +33,7 @@ def setup_logging():
     formatter = logging.Formatter('[%(asctime)s] %(levelname)-8s | %(name)-15s | %(message)s')
     
     # 1. Файловый handler - пишет ВСЁ (DEBUG и выше)
-    file_handler = logging.FileHandler(log_dir / "kaya_full.log", encoding='utf-8')
+    file_handler = logging.FileHandler(log_dir / "agent_full.log", encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     
@@ -58,6 +59,7 @@ def main():
     1. Логгирование старта агента
     2. Загрузка и проверка схемы БД Postgres
     3. Загрузка и проверка коллекции Qdrant
+    # 4. Запуск консольного интерфейса с управлением сессией
     """
     # Инициализация логгирования
     success = False
@@ -65,7 +67,7 @@ def main():
 
     try:
         # 1. Пишем старт сессии в лог
-        logger.info(f"Launching Kaya version {kaya_version}")
+        logger.info(f"Launching agent version {agent_version}")
 
         # 2. Убеждаемся, что схема БД Postgres актуальна (миграции применены)
         postgres_config = load_postgres_config()
@@ -81,6 +83,9 @@ def main():
             return 1
         
         success = True 
+
+        # 4. Запусr консольного интерфейса с передачей конфига БД и версии агента
+        #run_console_interface(postgres_config, agent_version)
 
                 
     except Exception as e:

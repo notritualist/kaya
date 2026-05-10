@@ -1,5 +1,5 @@
 """
-Creating a kaya_db collection in Qdrant for 2560d vectors
+Creating a agent_db collection in Qdrant for 2560d vectors
 With optimizations: INT8 quantization, on_disk_payload, and settings for high-dimensional data
 """
 
@@ -15,14 +15,14 @@ from qdrant_client.models import (
     WalConfigDiff
 )
 
-def create_kaya_db_collection():
+def create_agent_db_collection():
     """Создание коллекции для памяти агента с оптимизацией под 2560d векторы"""
     
     # Подключение к локальному Qdrant
     client = QdrantClient("localhost", port=6333)
     
     # Проверка существования коллекции
-    collection_name = "kaya_db"
+    collection_name = "agent_db"
     
     # Если коллекция существует, спросим что делать
     if client.collection_exists(collection_name):
@@ -108,7 +108,7 @@ def create_kaya_db_collection():
 def recreate_with_custom_settings():
     """Функция для пересоздания с кастомными настройками"""
     client = QdrantClient("localhost", port=6333)
-    collection_name = "kaya_db"
+    collection_name = "agent_db"
     
     # Удаляем если есть
     if client.collection_exists(collection_name):
@@ -116,7 +116,7 @@ def recreate_with_custom_settings():
         print("Old collection deleted")
     
     # Здесь можно вызвать create с другими параметрами
-    create_kaya_db_collection()
+    create_agent_db_collection()
 
 if __name__ == "__main__":
-    create_kaya_db_collection()
+    create_agent_db_collection()

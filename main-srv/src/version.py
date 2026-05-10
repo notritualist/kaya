@@ -1,7 +1,7 @@
 """
 /main-srv/src/version.py
 
-The module globally provides the Kaya project version from pyproject.toml.
+The module globally provides the agent version from pyproject.toml.
 Used everywhere the release version is required:
 - database migrations
 - database records

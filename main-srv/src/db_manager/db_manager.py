@@ -141,7 +141,7 @@ def ensure_qdrant_collections(qdrant_config: dict | None = None) -> bool:
         client.get_collections()
         logger.info("Successfully connected to the Qdrant database")
         
-        collection_name = "kaya_db"
+        collection_name = "agent_db"
         
         # Если коллекция уже есть — выходим
         if client.collection_exists(collection_name):
