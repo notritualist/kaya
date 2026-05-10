@@ -1,6 +1,6 @@
 """/main-srv/src/main.py"""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __description__ = "Main launch module of Kaya"
 
 
@@ -8,7 +8,7 @@ import sys
 import logging
 from pathlib import Path
 from version import __version__ as kaya_version # Версия проекта
-from db_manager.db_manager import load_postgres_config, ensure_postgres_schema_ready
+from db_manager.db_manager import load_postgres_config, ensure_postgres_schema_ready, load_qdrant_config, ensure_qdrant_collections
 
 
 def setup_logging():
@@ -21,6 +21,13 @@ def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     
+    # Подавляем DEBUG-сообщения от HTTP-библиотек
+    # При желании можно оставить DEBUG для httpx, если нужны полные сводки запросов:
+    # logging.getLogger("httpx").setLevel(logging.DEBUG)
+    
+    logging.getLogger("httpcore").setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.INFO)
+
     # Форматтер
     formatter = logging.Formatter('[%(asctime)s] %(levelname)-8s | %(name)-15s | %(message)s')
     
@@ -49,7 +56,8 @@ def main():
     Точка входа проекта.
     Последовательность:
     1. Логгирование старта агента
-    2. Загрузка и проверка схемы БД Postgres 
+    2. Загрузка и проверка схемы БД Postgres
+    3. Загрузка и проверка коллекции Qdrant
     """
     # Инициализация логгирования
     success = False
@@ -64,7 +72,16 @@ def main():
         if not ensure_postgres_schema_ready(postgres_config):
             logger.critical(f"Postgres database schema initialization failed")
             return 1
+        success = True
+
+        # 3. Убеждаемся, что коллекция Qdrant существует и доступна
+        qdrant_config = load_qdrant_config()
+        if not ensure_qdrant_collections(qdrant_config):
+            logger.critical(f"Failed to initialize Qdrant vector database")
+            return 1
+        
         success = True 
+
                 
     except Exception as e:
         logger.critical(f"Critical startup error {e}", exc_info=True)
