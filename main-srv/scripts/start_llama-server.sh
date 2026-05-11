@@ -31,8 +31,6 @@ exec "$SERVER_BIN" \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --jinja \
-  --reasoning off \
-  --reasoning-budget 0 \
   --flash-attn on \
   --threads 4 \
   --batch-size 2048 \

@@ -851,7 +851,7 @@ BEGIN
                 "presence_penalty": 1.5,
                 "repetition_penalty": 1.0,
                 "stop": ["<|im_end|>"],
-                "thinking": false
+                "chat_template_kwargs": {"enable_thinking": false}
             }'::jsonb,
             '{}'::jsonb,
             'testing'::public.prompt_status,
