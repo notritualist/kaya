@@ -1,19 +1,20 @@
 """
 main-srv/src/interfaces/console_interface.py
-Консольный интерфейс для диалога с AGI-агентом.
-С поддержкой многострочного ввода (Shift+Enter = новая строка, Enter = отправить)
-Логика работы:
-При старте определяет текущего пользователя ОС (Linux).
-Привязывает его к актору типа 'owner' в БД (если ещё не привязан).
-Создаёт НОВУЮ сессию диалога (каждый запуск = отдельная сессия).
-Запускает цикл: ввод пользователя → сохранение в БД → ожидание ответа → вывод.
-При выходе (exit / Ctrl+D) корректно завершает сессию в БД.
-Схема БД: dialogs.sessions, dialogs.row_messages, users.actors, users.actors_external_ids
-Версия миграции: V001
+
+A console interface for dialog with an AGI agent.
+With multi-line input support (Shift+Enter = new line, Enter = send).
+Operational logic:
+On startup, determines the current OS user (Linux).
+Binds it to an 'owner' actor in the database (if not already bound).
+Creates a NEW dialog session (each launch = a separate session).
+Starts a cycle: user input → save to database → wait for response → exit.
+On exit (exit / Ctrl+D), gracefully closes the database session.
+DB schema: dialogs.sessions, dialogs.row_messages, users.actors, users.actors_external_ids
+Migration version: V001
 """
 
 version = "1.0.0"
-description = "Консольный интерфейс диалога с агентом (owner-режим)"
+description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
 import pwd

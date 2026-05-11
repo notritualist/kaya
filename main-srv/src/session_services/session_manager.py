@@ -1,17 +1,18 @@
 """
 main-srv/src/session_services/session_manager.py
-Модуль управления сессиями диалогов для консольного интерфейса агента.
-Отвечает за:
-- Привязку пользователей (console:) к акторам, в том числе первого к типу 'owner' в БД
-- Создание НОВОЙ сессии для консоли, при каждом запуске агента
-- Сохранение сообщений пользователя в dialogs.row_messages
-- Завершение сессии при выходе
 
-Схема БД: миграция V001
-Таблицы: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.row_messages
+Dialog session management module for the agent console interface.
+Responsible for:
+- Assigning users (console:) to actors, including the first one to the 'owner' type in the database
+- Creating a NEW session for the console each time the agent starts
+- Saving user messages in dialogs.row_messages
+- Terminating the session on exit
+
+DB schema: migration V001
+Tables: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.row_messages
 """
 version = "1.0.0"
-description = "Менеджер сессий для консольного интерфейса агента"
+description = "Session manager for the agent console interface"
 
 import logging
 import psycopg2
