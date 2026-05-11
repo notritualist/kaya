@@ -1,24 +1,32 @@
 """
 main-srv/src/session_services/session_manager.py
 
-Dialog session management module for the agent console interface.
-Responsible for:
-- Assigning users (console:) to actors, including the first one to the 'owner' type in the database
-- Creating a NEW session for the console each time the agent starts
-- Saving user messages in dialogs.row_messages
-- Terminating the session on exit
+Session and dialog manager for agent interfaces.
 
-DB schema: migration V001
-Tables: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.row_messages
+Responsible for:
+- Binding users (console:) to actors (owner/user)
+- Creating a physical connection session (dialogs.sessions)
+- Managing the dialog lifecycle via dialog_services.dialogue_manager:
+* Lazy dialog creation on first message
+* Automatic inactivity timeout check
+* Manual dialog termination (Ctrl+N / rotate_dialogue)
+- Saving messages in dialogs.row_messages with a binding to dialog_id
+- Correctly ending dialogs and sessions on exit
+- Cleaning up frozen sessions and dialogs when restarting the agent
+
+DB schema: migration V002, migration V002
+Tables: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.dialogues, dialogs.row_messages
 """
-version = "1.0.0"
-description = "Session manager for the agent console interface"
+
+version = "1.0.1"
+description = "Session and dialog manager for the agent console interface"
 
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Optional
 from datetime import datetime, timezone
+from dialog_services.dialogue_manager import ensure_active_dialogue, close_active_dialogue
 
 # Логгер модуля — подхватит настройки из main.py
 logger = logging.getLogger(__name__)
@@ -26,26 +34,27 @@ logger = logging.getLogger(__name__)
 
 class SessionManager:
     """
-    Менеджер сессий для интерфейсов.
+    Менеджер сессий и диалогов для интерфейсов.
     Принцип работы:
-    - Каждый запуск консоли = новая сессия в БД (не возобновляем старые)
-    - Первый пользователь консоли привязывается к актору type='owner' через external_ids, 
-      последующие к типу 'user'
-    - Все сообщения пишутся в dialogs.row_messages с полным контекстом
-
+    - Каждый запуск консоли = новая физическая сессия (dialogs.sessions)
+    - Логический диалог (dialogs.dialogues) создаётся лениво при первом сообщении
+    - Таймаут неактивности и ручное завершение диалога (Ctrl+N) обрабатываются прозрачно
+    - Все сообщения пишутся в dialogs.row_messages с обязательным dialogue_id
+    
     Атрибуты:
         db_config (dict): параметры подключения к PostgreSQL
         agent_version (str): версия агента из pyproject.toml
         console_user_id (str): идентификатор в формате "console:<username>"
-        session_id (Optional[str]): UUID текущей сессии
+        session_id (Optional[str]): UUID текущей физической сессии
         actor_id (Optional[str]): UUID текущего актора (owner или user)
         actor_type (str): Тип актора: 'owner' или 'user'
+        current_dialogue_id (Optional[str]): UUID текущего активного диалога
         _conn: кэш соединения с БД
     """
 
     def __init__(self, db_config: dict, agent_version: str, console_user_id: str):
         """
-        Инициализация менеджера сессий.
+        Инициализация менеджера сессий и диалогов.
         
         Args:
             db_config: dict с параметрами подключения (host, port, dbname, user, password)
@@ -61,6 +70,7 @@ class SessionManager:
         self.actor_id: Optional[str] = None      # UUID актора (owner или user)
         self.actor_type: str = 'owner'           # Тип: 'owner' или 'user'
         self.actor_external_id: Optional[str] = None  # кэш внешнего ID
+        self.current_dialogue_id: Optional[str] = None # Кэш ID текущего диалога
         self._conn = None
             
         logger.debug(f"SessionManager created for {console_user_id}")
@@ -211,50 +221,53 @@ class SessionManager:
     @staticmethod
     def close_dangling_sessions(db_config: dict) -> int:
         """
-        Завершает «зависшие» активные сессии при перезапуске системы.
+        Завершает зависшие активные сессии и диалоги при перезапуске системы.
+        Вызывается из main.py перед стартом интерфейса.
+        Сначала закрывает диалоги (reason='system_restart'), затем сессии.
         
         Args:
             db_config: параметры подключения к PostgreSQL
-            
         Returns:
             int: количество закрытых сессий
         """
+        from dialog_services.dialogue_manager import close_dangling_dialogues
+        # Сначала закрываем зависшие диалоги, затем сессии
+        close_dangling_dialogues(db_config)
+        
         logger.info("Checking for dangling sessions...")
         try:
             with psycopg2.connect(**db_config) as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
                         UPDATE dialogs.sessions
-                        SET 
-                            status = 'completed'::session_status,
-                            closed_at = NOW(),
-                            updated_at = NOW(),
+                        SET status = 'completed'::session_status, closed_at = NOW(), updated_at = NOW(), 
                             reason = 'system_restart'::session_close_reason
                         WHERE status = 'active'
                     """)
                     count = cur.rowcount
                     conn.commit()
-                    
                     if count > 0:
                         logger.warning(f"Closed {count} dangling sessions on startup")
-                    else:
-                        logger.debug("No dangling sessions found")
                     return count
         except Exception as e:
             logger.error(f"Error closing dangling sessions: {e}", exc_info=True)
-            return 0         
+            return 0        
 
     def create_session(self) -> str:
         """
-        Создаёт НОВУЮ сессию диалога.
-        Важно: каждый запуск консоли = новая сессия (не resume).
-                
+        Создаёт новую физическую сессию диалога (dialogs.sessions).
+        Логический диалог создаётся лениво в save_message().
+        
         Returns:
             str: UUID новой сессии
+        Raises:
+            RuntimeError: если сессия уже активна или actor_id не задан
+        
+        Важно: каждый запуск консоли = новая сессия (не resume).
         """
         if self.session_id:
             logger.warning(f"Session already active: {self.session_id[:8]}")
-            raise RuntimeError("Session already active:")
+            raise RuntimeError("Session already active: ")
         if not self.actor_id:
             logger.error("Actor_id not set. Call ensure_actor_linked() first")
             raise RuntimeError("Actor_id not set. Call ensure_actor_linked() first")
@@ -298,14 +311,33 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Error creating session: {e}", exc_info=True)
             raise
+    
+    def rotate_dialogue(self, reason: str = 'user_new_dialogue'):
+        """
+        Вручную завершает текущий активный диалог и сбрасывает кэш.
+        Вызывается при Ctrl+N из интерфейса.
+        Диалог закрывается с указанной причиной. Следующее сообщение создаст новый.
+        
+        Args:
+            reason: причина закрытия (должна соответствовать dialog_close_reason ENUM)
+        """
+        if not self.session_id or not self.actor_id:
+            logger.warning("Cannot rotate dialogue: no active session/actor")
+            return
+            
+        logger.info(f"Rotating dialogue. Reason: {reason}")
+        close_active_dialogue(self.db_config, self.session_id, self.actor_id, reason)
+        self.current_dialogue_id = None
 
     def save_message(self, content: str) -> str:
         """
-        Сохраняет сообщение пользователя в dialogs.messages.
-                      
+        Сохраняет сообщение пользователя в dialogs.row_messages.
+        Автоматически обеспечивает наличие активного диалога (V002).
+                  
         Заполняет поля согласно миграциям БД:
         - actor_id, actor_type (из self.actor_type: 'owner' или 'user')
         - session_id
+        - dialogue_id (автоматически через ensure_active_dialogue)
         - row_text (сырой текст)
         - agent_version, timestamp
         
@@ -324,6 +356,12 @@ class SessionManager:
         logger.debug(f"Saving message: {len(content)} characters")
         
         try:
+            # V002: === ШАГ 0: ГАРАНТИРУЕМ АКТИВНЫЙ ДИАЛОГ (ПРОВЕРКА ТАЙМАУТА) ===
+            # Функция вернет ID существующего диалога или создаст новый, если истек таймаут
+            self.current_dialogue_id = ensure_active_dialogue(
+                self.db_config, self.session_id, self.actor_id, self.agent_version
+            )
+
             # === ШАГ 1: Вычисляем parent_message_id и user_think_latency ===
             parent_message_id: Optional[str] = None
             user_think_latency: Optional[float] = None
@@ -335,10 +373,10 @@ class SessionManager:
                         FROM dialogs.row_messages m
                         WHERE m.session_id = %s
                             AND (
-                                (m.actor_type = 'system' 
+                                 (m.actor_type = 'system' 
                                 AND m.parent_message_id IN (
                                     SELECT id FROM dialogs.row_messages 
-                                    WHERE session_id = %s AND actor_id = %s
+                                     WHERE session_id = %s AND actor_id = %s
                                 )
                                 )
                                 OR (m.actor_id = %s AND m.actor_type != 'system')
@@ -354,31 +392,33 @@ class SessionManager:
                         current_timestamp = datetime.now(timezone.utc)
                         user_think_latency = (current_timestamp - prev_timestamp).total_seconds()
                         logger.debug(
-                            f"parent_message_id: {parent_message_id[:8]}, "
+                            f"parent_message_id: {parent_message_id[:8]},  "
                             f"user_think_latency: {user_think_latency:.2f} sec"
                         )
             
-            # === ШАГ 2: Вставляем сообщение===
+            # === ШАГ 2: Вставляем сообщение с dialogue_id ===
             row = self._query("""
                 INSERT INTO dialogs.row_messages 
                 (
                     parent_message_id,
                     actor_id, 
                     actor_type, 
-                    session_id, 
+                    session_id,
+                    dialogue_id,  
                     row_text,
                     answer_latency,
                     agent_version, 
                     orchestrator_step_id,
                     timestamp
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, params=(
                 parent_message_id,
                 self.actor_id,
                 self.actor_type,
                 self.session_id,
+                self.current_dialogue_id, # V002: ID диалога
                 content,              # row_text — сырой текст
                 user_think_latency,
                 self.agent_version,
@@ -391,8 +431,8 @@ class SessionManager:
                 raise RuntimeError("Failed to save message (no RETURNING id)")
             
             msg_id = str(row['id'])
-            logger.debug(f"Message saved:  {msg_id[:8]}")
-                      
+            logger.debug(f"Message saved: {msg_id[:8]}")
+                  
             return msg_id
             
         except ValueError as e:
@@ -400,7 +440,7 @@ class SessionManager:
             raise
         except Exception as e:
             logger.error(f"Error saving message: {e}", exc_info=True)
-        raise
+            raise
 
     def update_activity(self):
         """Обновляет updated_at текущей сессии."""
@@ -417,10 +457,11 @@ class SessionManager:
             raise
 
     def close_session(self, reason: str = "unknown"):
-        """Завершает сессию: status='completed', closed_at=NOW(), reason=?.
+        """
+        Завершает сессию и активный диалог: status='completed', closed_at=NOW(), reason=?.
         
         Args:
-        reason: причина завершения (должна соответствовать ENUM session_close_reason в БД)
+            reason: причина завершения (должна соответствовать ENUM session_close_reason в БД)
         """
         if not self.session_id:
             logger.debug("No active session to close")
@@ -428,6 +469,10 @@ class SessionManager:
         
         logger.info(f"Closing session {self.session_id[:8]} with reason: {reason}")
         try:
+            # V002: Перед закрытием сессии обязательно закрываем активный диалог
+            if self.actor_id:
+                close_active_dialogue(self.db_config, self.session_id, self.actor_id, 'session_end')
+
             self._query("""
                 UPDATE dialogs.sessions 
                 SET status = 'completed'::session_status, 

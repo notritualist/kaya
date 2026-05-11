@@ -49,15 +49,20 @@ agent/
 │       │   └── migrations/
 │       │       ├── __init__.py
 │       │       ├── pg_migration_manager.py      # Менеджер применений миграций БД
-│       │       └── V001_initial.sql             # Начальная схема (основные таблицы агента для PostgreSQL)
+│       │       ├── V001_initial.sql             # Начальная схема (основные таблицы агента для PostgreSQL)
+│       │       └── V002_dialogues.sql           # Схема слоя диалогов
 │       │
-│       ├── interfaces/               # Интерфейсы
+│       ├── dialog_services/     # Управление жизненным циклом диалогов
 │       │   ├── __init__.py
-│       │   └── console_interface.py  # Консольный UI (клиент)
+│       │   └── dialogue_manager.py  # Менеджер управления диалогами
+│       │
+│       ├── interfaces/          # Интерфейсы
+│       │   ├── __init__.py
+│       │   └── console_interface.py  # Консольный UI
 │       │  
-│       └── session_services/         # Управление сессиями
+│       └── session_services/    # Управление сессиями
 │           ├── __init__.py
-│           └── session_manager.py    # Менеджер жизненного цикла сессий
+│           └── session_manager.py    # Менеджер жизненного цикла сессий и диалогов
 │
 └── docs/                        # Документация
 └── ...

@@ -13,7 +13,7 @@ DB schema: dialogs.sessions, dialogs.row_messages, users.actors, users.actors_ex
 Migration version: V001
 """
 
-version = "1.0.0"
+version = "1.0.1"
 description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
@@ -60,11 +60,12 @@ def _print_status(message: str, is_success: bool):
 
     print(f"{color}[{symbol}] {message}{COLOR_RESET}")
 
-def create_prompt_session() -> PromptSession:
+def create_prompt_session(session_manager: SessionManager) -> PromptSession:
     """
     Создаёт сессию prompt_toolkit с поддержкой:
     - Enter = отправить сообщение
     - Alt+Enter = новая строка
+    - Ctrl+N = Новый диалог (очистка контекста, вызов session_manager.rotate_dialogue)
     - Ctrl+D = аварийный выход
     - Ctrl+C = игнорируется (чтобы не выходить случайно)
     """
@@ -88,6 +89,15 @@ def create_prompt_session() -> PromptSession:
     @bindings.add('c-c')
     def _(event):
         pass
+
+    # Ctrl+N = Новый диалог (разрыв контекста)
+    @bindings.add('c-n')
+    def _(event):
+        print("\n[!] Initiating new dialogue...")
+        session_manager.rotate_dialogue("user_new_dialogue")
+        print("[OK] New dialogue started. Context cleared.\n")
+        # Очищаем буфер, чтобы не отправить мусор
+        event.current_buffer.text = ""
 
     return PromptSession(
         key_bindings=bindings,
@@ -142,8 +152,8 @@ def run_console_interface(db_config: dict, agent_version: str):
         # === ШАГ 5: Вывод приветствия (теперь все данные известны) ===
         _print_welcome(agent_version, console_user_id, session_service.actor_type)
         
-        # === ШАГ 5.1: Создаём сессию ввода ===
-        prompt_session = create_prompt_session()
+        # === ШАГ 5.1: Создаём сессию ввода с привязкой менеджера (для Ctrl+N) ===
+        prompt_session = create_prompt_session(session_service)
 
         # === ШАГ 6: Основной цикл диалога ===
         while True:
