@@ -43,13 +43,21 @@ agent/
 │       ├── main.py              # Точка входа (запуск агента)
 │       ├── version.py           # Глобальная версия из pyproject.toml
 │       │
-│       └── db_manager/          # Управление БД
+│       ├── db_manager/          # Управление БД
+│       │   ├── __init__.py
+│       │   ├── db_manager.py    # Подключение к PostgreSQL
+│       │   └── migrations/
+│       │       ├── __init__.py
+│       │       ├── pg_migration_manager.py      # Менеджер применений миграций БД
+│       │       └── V001_initial.sql             # Начальная схема (основные таблицы агента для PostgreSQL)
+│       │
+│       ├── interfaces/               # Интерфейсы
+│       │   ├── __init__.py
+│       │   └── console_interface.py  # Консольный UI (клиент)
+│       │  
+│       └── session_services/         # Управление сессиями
 │           ├── __init__.py
-│           ├── db_manager.py    # Подключение к PostgreSQL
-│           └── migrations/
-│               ├── __init__.py
-│               ├── pg_migration_manager.py      # Менеджер применений миграций БД
-│               └── V001_initial.sql             # Начальная схема (основные таблицы агента для PostgreSQL)
+│           └── session_manager.py    # Менеджер жизненного цикла сессий
 │
 └── docs/                        # Документация
 └── ...

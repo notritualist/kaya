@@ -19,8 +19,8 @@ agent/
 ├── main-srv/                    # Main server
 │   ├── .venv/                   # Python virtual environment
 │   ├── configs/
-│   │   ├── postgres_config.yaml # PostgreSQL connection configuration
-│   │   └── qdrant_config.yaml   # Qdrant connection configuration
+│   │   ├── postgres_config.yaml # PostgreSQL database connection config
+│   │   └── qdrant_config.yaml   # Qdrant database connection config
 │   │
 │   ├── llama.cpp/               # llama.cpp submodule (fork)
 │   │   ├── CMakeLists.txt
@@ -28,7 +28,7 @@ agent/
 │   │   ├── build/               # Built binaries (ignored by git)
 │   │   └── ...                  # llama.cpp source files
 │   │
-│   ├── logs                     # Agent logs for main-srv
+│   ├── logs                     # Agent operation logs for main-srv
 │   │   └── kaya_full.log        # Full log (DEBUG+)
 │   │
 │   ├── models/                  # LLM models (ignored by git)
@@ -40,16 +40,24 @@ agent/
 │   │
 │   └── src/                     # Python source code
 │       ├── __init__.py
-│       ├── main.py              # Entry point (agent startup)
+│       ├── main.py              # Entry point (start agent)
 │       ├── version.py           # Global version from pyproject.toml
 │       │
-│       └── db_manager/          # Database management
+│       ├── db_manager/          # Database management
+│       │   ├── __init__.py
+│       │   ├── db_manager.py    # PostgreSQL connection
+│       │   └── migrations/
+│       │       ├── __init__.py
+│       │       ├── pg_migration_manager.py      # Database migration manager
+│       │       └── V001_initial.sql             # Initial schema (main PostgreSQL agent tables)
+│       │
+│       ├── interfaces/               # Interfaces
+│       │   ├── __init__.py
+│       │   └── console_interface.py  # Console UI (client)
+│       │  
+│       └── session_services/         # Session management
 │           ├── __init__.py
-│           ├── db_manager.py    # PostgreSQL connection
-│           └── migrations/
-│               ├── __init__.py
-│               ├── pg_migration_manager.py      # Database migration manager
-│               └── V001_initial.sql             # Initial schema (main agent tables for PostgreSQL)
+│           └── session_manager.py    # Session lifecycle manager
 │
 └── docs/                        # Documentation
 └── ...

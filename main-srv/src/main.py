@@ -9,7 +9,8 @@ import logging
 from pathlib import Path
 from version import __version__ as agent_version # Версия проекта
 from db_manager.db_manager import load_postgres_config, ensure_postgres_schema_ready, load_qdrant_config, ensure_qdrant_collections
-# from interfaces.console_interface import run_console_interface
+from interfaces.console_interface import run_console_interface
+from session_services.session_manager import SessionManager
 
 
 def setup_logging():
@@ -59,7 +60,8 @@ def main():
     1. Логгирование старта агента
     2. Загрузка и проверка схемы БД Postgres
     3. Загрузка и проверка коллекции Qdrant
-    # 4. Запуск консольного интерфейса с управлением сессией
+    4. Очистка зависших после рестарта сессий пользователей
+    5. Запуск консольного интерфейса с управлением сессиями
     """
     # Инициализация логгирования
     success = False
@@ -84,8 +86,11 @@ def main():
         
         success = True 
 
-        # 4. Запусr консольного интерфейса с передачей конфига БД и версии агента
-        #run_console_interface(postgres_config, agent_version)
+        # 4. Очистка зависших до рестарта сессий
+        SessionManager.close_dangling_sessions(postgres_config)
+
+        # 5. Запуск консольного интерфейса с передачей конфига БД и версии агента
+        run_console_interface(postgres_config, agent_version)
 
                 
     except Exception as e:

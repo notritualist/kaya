@@ -132,6 +132,21 @@ END $$;
 COMMENT ON TYPE public.reasoning_content_type IS 'Тип рассуждений: messages - анализ ссобщений диалога, 
 reflection - рефлексия над производными первого порядка, second_reflection - рефлексия над производными второго порядка';
 
+-- Создание ENUM для причин завершения сессии
+DO $$ BEGIN
+IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'public.session_close_reason') THEN
+    CREATE TYPE public.session_close_reason AS ENUM (
+        'user_exit',      -- Корректный выход (Ctrl+D / EOF)
+        'user_command',   -- Команда выхода (exit / выход)
+        'system_restart', -- Зависшая сессия при рестарте сервера
+        'loop_error',     -- Ошибка в цикле диалога
+        'critical_error', -- Критическая ошибка агента
+        'unknown'         -- Причина не определена
+    );
+END IF;
+END $$;
+COMMENT ON TYPE public.session_close_reason IS 'Причины завершения сессии диалога';
+
 
 -- Блок 3: Общие функции
 -- Общая функция для обновления полей updated_at
@@ -298,6 +313,7 @@ CREATE TABLE IF NOT EXISTS dialogs.sessions (
     actor_id UUID NOT NULL REFERENCES users.actors(id) ON DELETE CASCADE,
     actor_external_id UUID REFERENCES users.actors_external_ids(id) ON DELETE SET NULL,
     status session_status NOT NULL DEFAULT 'active',
+    reason session_close_reason,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ,
     closed_at TIMESTAMPTZ,
@@ -316,6 +332,8 @@ COMMENT ON COLUMN dialogs.sessions.actor_id IS 'ID участника диало
 COMMENT ON COLUMN dialogs.sessions.actor_external_id IS 'ID внешнего источника подключения пользователя (например, конкретный Telegram аккаунт). 
 Ссылка на users.actors_external_ids. При удалении внешнего ID устанавливается NULL.';
 COMMENT ON COLUMN dialogs.sessions.status IS 'Статус сессии: active - активная (диалог продолжается), completed - завершенная (диалог окончен)';
+COMMENT ON COLUMN dialogs.sessions.reason IS 'Причина завершения сессии: user_exit (корректный выход Ctrl+D), user_command (команда exit/выход), system_restart 
+(зависшая сессия при перезапуске), loop_error (ошибка в цикле диалога), critical_error (критическая ошибка), unknown (неизвестно)';
 COMMENT ON COLUMN dialogs.sessions.created_at IS 'Дата и время начала сессии (создания записи)';
 COMMENT ON COLUMN dialogs.sessions.updated_at IS 'Метка времени последнего сообщения в диалоге (обновляется при каждом новом сообщении)';
 COMMENT ON COLUMN dialogs.sessions.closed_at IS 'Дата и время завершения сессии (устанавливается при переходе в статус completed)';
