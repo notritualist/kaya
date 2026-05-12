@@ -20,7 +20,7 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
 
 # Настраиваемая константа таймаута неактивности (в минутах)
-DIALOGUE_INACTIVITY_TIMEOUT_MINUTES = 1
+DIALOGUE_INACTIVITY_TIMEOUT_MINUTES = 30
 
 logger = logging.getLogger(__name__)
 
