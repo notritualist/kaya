@@ -20,7 +20,8 @@ agent/
 │   ├── .venv/                   # Виртуальное окружение Python
 │   ├── configs/
 │   │   ├── postgres_config.yaml # Конфигурация подключения к БД PostgresSQL
-│   │   └── qdrant_config.yaml   # Конфигурация подключения к БД Qdrant
+│   │   ├── qdrant_config.yaml   # Конфигурация подключения к БД Qdrant
+│   │   └── model_routing.yaml   # Конфигурация роутинга LLM-провайдеров
 │   │
 │   ├── llama.cpp/               # Субмодуль llama.cpp (форк)
 │   │   ├── CMakeLists.txt
@@ -34,6 +35,8 @@ agent/
 │   ├── models/                  # LLM модели (игнорируется git)
 │   │   └── qwen3_5/
 │   │       └── Qwen3.5-9B-Q4_K_M.gguf
+│   │
+│   ├── requirements.txt        # Файл зависимостей .venv (main-srv)
 │   │
 │   ├── scripts/
 │   │   └── start_llama-server.sh # Запуск llama-server (API)
@@ -60,9 +63,31 @@ agent/
 │       │   ├── __init__.py
 │       │   └── console_interface.py  # Консольный UI
 │       │  
-│       └── session_services/    # Управление сессиями
+│       ├── session_services/    # Управление сессиями
+│       │    ├── __init__.py
+│       │    └── session_manager.py    # Менеджер жизненного цикла сессий и диалогов
+│       │
+│       ├── orchestrator/        # Ядро оркестрации задач
+│       │   ├── __init__.py
+│       │   ├── orchestrator_entry.py   # Точка входа: создание задач из внешних событий
+│       │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
+│       │   └── response_composer.py    # Генерация финального ответа через ModelService
+│       │
+│       ├── model_service/       # Абстракция доступа к LLM с роутингом
+│       │   ├── __init__.py
+│       │   ├── model_service.py        # Роутер: выбор провайдера по model_name
+│       │   ├── config/
+│       │   │   └── model_routing.yaml  # Правила роутинга и конфиги провайдеров
+│       │   └── providers/              # Реализации провайдеров сервисов LLM
+│       │       ├── __init__.py
+│       │       ├── base.py                 # Абстрактный интерфейс LLMProvider
+│       │       ├── local_llama.py          # Провайдер для локального llama-server
+│       │       └── external_dashscope.py   # Провайдер для DashScope API (заглушка)
+│       │
+│       └── services/            # Вспомогательные сервисные функции
 │           ├── __init__.py
-│           └── session_manager.py    # Менеджер жизненного цикла сессий и диалогов
+│           ├── service_metrics.py    # Обновление статусов задач/шагов, сохранение метрик
+│           └── tokens_counter.py     # Подсчёт токенов для моделей Qwen
 │
-└── docs/                        # Документация
-└── ...
+└── docs/                             # Документация
+    └── ...

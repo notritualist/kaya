@@ -20,9 +20,11 @@ import logging
 import pwd
 import os
 from session_services.session_manager import SessionManager
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+
 
 # Получаем логгер для этого модуля
 logger = logging.getLogger(__name__)
@@ -93,11 +95,18 @@ def create_prompt_session(session_manager: SessionManager) -> PromptSession:
     # Ctrl+N = Новый диалог (разрыв контекста)
     @bindings.add('c-n')
     def _(event):
-        print("\n[!] Initiating new dialogue...")
+        # Используем print_formatted_text вместо print() — не ломает верстку prompt_toolkit
+        print_formatted_text(HTML('\n<b>[!]</b> Initiating new dialogue...'))
+        
         session_manager.rotate_dialogue("user_new_dialogue")
-        print("[OK] New dialogue started. Context cleared.\n")
+        
+        print_formatted_text(HTML('<b>[OK]</b> New dialogue started.\n'))
+        
         # Очищаем буфер, чтобы не отправить мусор
         event.current_buffer.text = ""
+        
+        # Принудительно перерисовываем промпт
+        event.app.invalidate()
 
     return PromptSession(
         key_bindings=bindings,
@@ -176,7 +185,15 @@ def run_console_interface(db_config: dict, agent_version: str):
                 message_id = session_service.save_message(content=user_input)
                 logger.debug(f"Message saved to DB with ID: {message_id[:8]}")
                 
-                # 6.2: Создаём задачу для оркестратора (пока заглушка)
+                # 6.2: Создаём задачу для оркестратора
+                from orchestrator.orchestrator_entry import on_user_message
+                try:
+                    orchestrator_task_id = on_user_message(message_id=message_id)
+                    logger.debug(f"Orchestrator task submitted: {orchestrator_task_id[:8]}...")
+                except Exception as e:
+                    logger.error(f"Failed to submit orchestrator task for message {message_id[:8]}: {e}", exc_info=True)
+                    # Не прерываем цикл — просто ждём ответа (он не придёт, но интерфейс останется жив)
+                    orchestrator_task_id = None
                                                  
                 # 6.3: Обновляем время активности сессии
                 session_service.update_activity()
@@ -188,7 +205,7 @@ def run_console_interface(db_config: dict, agent_version: str):
                 # 6.5: Ожидаем ответ от агента
                 agent_response = session_service.wait_for_agent_response(
                     user_message_id=message_id,
-                    timeout_seconds=120
+                    timeout_seconds=300
                 )
 
                 # 6.6: Заменяем статус на ответ
@@ -201,7 +218,7 @@ def run_console_interface(db_config: dict, agent_version: str):
 
             except KeyboardInterrupt:
                 logger.warning("Session interrupted by user (Ctrl+D)")
-                print("\n\n[!] Interrupted by user")
+                
                 exit_reason = "user_exit"
                 break
                 
