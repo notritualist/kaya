@@ -217,7 +217,7 @@ def run_console_interface(db_config: dict, agent_version: str):
                     logger.warning("Timeout waiting for agent response")
 
             except KeyboardInterrupt:
-                logger.warning("Session interrupted by user (Ctrl+D)")
+                logger.info("Session interrupted by user (Ctrl+D)")
                 
                 exit_reason = "user_exit"
                 break
