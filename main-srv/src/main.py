@@ -1,6 +1,6 @@
 """/main-srv/src/main.py"""
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 __description__ = "Main launch module of agent"
 
 import sys
@@ -93,7 +93,7 @@ def main():
         # 5. Запуск цикла оркестратора
         start_orchestrator()
         
-        # 5. Запуск консольного интерфейса с передачей конфига БД и версии агента
+        # 6. Запуск консольного интерфейса с передачей конфига БД и версии агента
         run_console_interface(postgres_config, agent_version)
 
                 

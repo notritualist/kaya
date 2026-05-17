@@ -13,7 +13,7 @@ DB schema: dialogs.sessions, dialogs.row_messages, users.actors, users.actors_ex
 Migration version: V001
 """
 
-version = "1.0.1"
+version = "1.1.0"
 description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
@@ -164,6 +164,12 @@ def run_console_interface(db_config: dict, agent_version: str):
         # === ШАГ 5.1: Создаём сессию ввода с привязкой менеджера (для Ctrl+N) ===
         prompt_session = create_prompt_session(session_service)
 
+        # === ШАГ 5.2 --- PGS Lifecycle Initialization (after actor and session is guaranteed to exist) ---
+        # Запуск уточнения причины завершения работы для псевдогормональной системы
+        from pgs_service.lifecycle_manager import LifecycleManager
+        lifecycle_mgr = LifecycleManager(db_config)
+        lifecycle_mgr.handle_startup()
+
         # === ШАГ 6: Основной цикл диалога ===
         while True:
             try:
@@ -236,8 +242,19 @@ def run_console_interface(db_config: dict, agent_version: str):
     # === ШАГ 7: Завершение сессии ===
     finally:
         logger.info(f"Closing dialog session with reason: {exit_reason}")
+       
+        # --- PGS Graceful Shutdown ---
+        from pgs_service.lifecycle_manager import LifecycleManager
+
+        lifecycle_mgr = LifecycleManager(db_config)
+        actor_id = session_service.actor_id  # или вызвать _get_current_actor_id()
+        if exit_reason in ("user_command", "user_exit"):
+            # Но handle_graceful_shutdown уже сам получает actor_id — ок!
+            lifecycle_mgr.handle_graceful_shutdown(exit_reason)
+                
         session_service.close_session(reason=exit_reason)
         _print_status("Session completed. Data saved to DB.", True)
+        
         session_service.cleanup()
         logger.debug("Console interface resources released")
 

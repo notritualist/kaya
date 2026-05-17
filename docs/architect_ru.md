@@ -51,9 +51,10 @@ agent/
 │       │   ├── db_manager.py    # Подключение к PostgreSQL
 │       │   └── migrations/
 │       │       ├── __init__.py
-│       │       ├── pg_migration_manager.py      # Менеджер применений миграций БД
-│       │       ├── V001_initial.sql             # Начальная схема (основные таблицы агента для PostgreSQL)
-│       │       └── V002_dialogues.sql           # Схема слоя диалогов
+│       │       ├── pg_migration_manager.py         # Менеджер применений миграций БД
+│       │       ├── V001_initial.sql                # Начальная схема (основные таблицы агента для PostgreSQL)
+│       │       ├── V002_dialogues.sql              # Схема слоя диалогов
+│       │       └── V003_pseudohormonal_system.sql  # Схема ПГС: состояния, baseline, momentary, self_knowledge
 │       │
 │       ├── dialog_services/     # Управление жизненным циклом диалогов
 │       │   ├── __init__.py
@@ -62,16 +63,6 @@ agent/
 │       ├── interfaces/          # Интерфейсы
 │       │   ├── __init__.py
 │       │   └── console_interface.py  # Консольный UI
-│       │  
-│       ├── session_services/    # Управление сессиями
-│       │    ├── __init__.py
-│       │    └── session_manager.py    # Менеджер жизненного цикла сессий и диалогов
-│       │
-│       ├── orchestrator/        # Ядро оркестрации задач
-│       │   ├── __init__.py
-│       │   ├── orchestrator_entry.py   # Точка входа: создание задач из внешних событий
-│       │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
-│       │   └── response_composer.py    # Генерация финального ответа через ModelService
 │       │
 │       ├── model_service/       # Абстракция доступа к LLM с роутингом
 │       │   ├── __init__.py
@@ -83,6 +74,20 @@ agent/
 │       │       ├── base.py                 # Абстрактный интерфейс LLMProvider
 │       │       ├── local_llama.py          # Провайдер для локального llama-server
 │       │       └── external_dashscope.py   # Провайдер для DashScope API (заглушка)
+│       │
+│       ├── orchestrator/        # Ядро оркестрации задач
+│       │   ├── __init__.py
+│       │   ├── orchestrator_entry.py   # Точка входа: создание задач из внешних событий
+│       │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
+│       │   └── response_composer.py    # Генерация финального ответа через ModelService
+│       │
+│       ├── pgs_service/                  # Псевдогормональная система
+│       │    ├── __init__.py
+│       │    └── lifecycle_manager.py      # Управление жизненным циклом агента (off/sleep/active) 
+│       │ 
+│       ├── session_services/    # Управление сессиями
+│       │    ├── __init__.py
+│       │    └── session_manager.py    # Менеджер жизненного цикла сессий и диалогов
 │       │
 │       └── services/            # Вспомогательные сервисные функции
 │           ├── __init__.py
