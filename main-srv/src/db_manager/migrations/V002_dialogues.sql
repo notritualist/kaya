@@ -31,7 +31,7 @@ COMMENT ON TYPE dialog_close_reason IS 'Причины завершения ди
 user_new_dialogue - явный запрос пользователя (Ctrl+N)
 inactivity_timeout - автоматическое закрытие по таймауту
 session_end - завершение вместе с родительской сессией
-system_restart - зависший диалог при рестарте серверат';
+system_restart - зависший диалог при рестарте сервера';
 
 -- 3. Создание таблицы диалогов
 CREATE TABLE IF NOT EXISTS dialogs.dialogues (

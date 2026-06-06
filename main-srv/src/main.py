@@ -1,6 +1,6 @@
 """/main-srv/src/main.py"""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Main launch module of agent"
 
 import sys
@@ -62,7 +62,8 @@ def main():
     3. Загрузка и проверка коллекции Qdrant
     4. Очистка зависших после рестарта сессий пользователей
     5. Запуск цикла оркестратора
-    6. Запуск консольного интерфейса с управлением сессиями
+    6. Запуск планировщика ПГС
+    7. Запуск консольного интерфейса с управлением сессиями
     """
     # Инициализация логгирования
     success = False
@@ -92,8 +93,13 @@ def main():
 
         # 5. Запуск цикла оркестратора
         start_orchestrator()
+
+        # 6. Запуск планировщика ПГС ===
+        from phs_service.phs_scheduler import PHSScheduler
+        phs_scheduler = PHSScheduler()
+        phs_scheduler.start()
         
-        # 6. Запуск консольного интерфейса с передачей конфига БД и версии агента
+        # 7. Запуск консольного интерфейса с передачей конфига БД и версии агента
         run_console_interface(postgres_config, agent_version)
 
                 

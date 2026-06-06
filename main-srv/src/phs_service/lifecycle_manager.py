@@ -1,7 +1,7 @@
 """
-main-srv/src/pgs_service/lifecycle_manager.py
+main-srv/src/phs_service/lifecycle_manager.py
 A service module for managing the agent's pseudohormonal lifecycle states.
-Version: 1.0.0
+Version: 1.1.0
 Fixes:
 - Correctly handles open 'off' state on startup (graceful shutdown detection).
 - Fixed invalid enum value 'crash' -> 'crash_recovery'.
@@ -11,7 +11,8 @@ description = "Pseudohormonal lifecycle state manager"
 import logging
 from datetime import datetime, timezone
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
+from typing import Dict, Any, Optional
 # Import global agent version from pyproject.toml
 from version import __version__ as agent_version
 
@@ -162,47 +163,104 @@ class LifecycleManager:
                         %s, 'off', %s, %s, 'crash_recovery', %s, %s
                     )
                 """, (actor_id, started_at, ended_at, shutdown_id, agent_version))
+    
+    def _create_phs_drift_task(self, drift_type: str, input_data: dict):
+        """Создаёт задачу phs_baseline_drift напрямую через SQL."""
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id FROM orchestrator.task_types WHERE type_name = 'phs_baseline_drift'")
+                task_type_id = cur.fetchone()["id"]
+                full_input = {"drift_type": drift_type, **input_data}
+                cur.execute("""
+                    INSERT INTO orchestrator.orchestrator_tasks (
+                        task_type_id, input_data, priority, status, agent_version, created_at
+                    ) VALUES (%s, %s, 0.3, 'pending', %s, NOW())
+                """, (task_type_id, Json(full_input), agent_version))
+                conn.commit()
+    
+    def _get_last_shutdown_reason(self, actor_id: str) -> Optional[Dict[str, Any]]:
+        """Возвращает последнюю запись из state.shutdown_reasons для актора."""
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT shutdown_type, timestamp
+                    FROM state.shutdown_reasons
+                    WHERE actor_id = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (actor_id,))
+                return cur.fetchone()
 
     def handle_startup(self):
         """Вызывается при запуске main.py. Обрабатывает восстановление после неграциозного завершения."""
         logger.info("Starting pseudohormonal lifecycle recovery...")
         actor_id = self._get_current_actor_id()
 
+        # === ШАГ 0: Инициализация baseline (если ещё не создан) ===
+        from phs_service.baseline_manager import BaselineManager
+        baseline_mgr = BaselineManager(self.db_config)
+        baseline_mgr.ensure_baseline_initialized()
+
         # 1. Найти последнее состояние ДЛЯ ЭТОГО АКТОРА
         last = self._get_last_lifecycle(actor_id)
         
         if last is None:
-            # Первый запуск
+            # Первый запуск – сразу создаём active
             self._start_new_lifecycle(actor_id, 'startup', 'active')
             return
 
-        # === FIX: Корректная обработка штатного выключения ===
-        # Если последнее состояние 'off', значит агент был выключен корректно.
-        # handle_graceful_shutdown оставляет off с ended_at=NULL, это валидное состояние "выключен".
+        # 2. Определяем, было ли незакрытое active (крэш) или штатное off
+        #    Вычисляем время начала простоя (downtime_start) и причину
+        if last['state_type'] == 'active' and last['ended_at'] is None:
+            # Оборванная сессия (крэш)
+            downtime_start = last['started_at']
+            is_crash = True
+        elif last['state_type'] == 'off':
+            # Штатное выключение: downtime_start = ended_at (если есть) или started_at
+            downtime_start = last['ended_at'] or last['started_at']
+            is_crash = False
+        else:
+            # Неожиданное состояние (например, sleep) – обрабатываем как обычный старт
+            downtime_start = last['started_at']
+            is_crash = False
+
+        downtime_duration = (datetime.now(timezone.utc) - downtime_start).total_seconds()
+
+        # 3. Обработка краша (если есть незакрытое active)
+        if is_crash:
+            logger.warning("Detected unclean shutdown. Prompting for downtime reason.")
+            shutdown_type = self._prompt_shutdown_reason()
+            shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
+
+            # Применяем коррекцию baseline СРАЗУ
+            baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
+
+            # Закрываем зависшее активное состояние
+            self._close_current_lifecycle(actor_id, 'crash_recovery', shutdown_id)
+
+            # Вставляем состояние 'off' задним числом
+            self._insert_off_state(actor_id, downtime_start, datetime.now(timezone.utc), shutdown_id)
+
+            # Создаём новое 'active'
+            self._start_new_lifecycle(actor_id, 'startup', 'active')
+            return
+
+        # 4. Штатное выключение (последнее состояние было off)
         if last['state_type'] == 'off':
-            # Если off ещё открыт, закрываем его сейчас (конец простоя = startup)
+            # Если off не закрыт (rare), закрываем
             if last['ended_at'] is None:
                 self._close_current_lifecycle(actor_id, 'startup', None)
             
-            # Запускаем новое активное состояние
+            # ВСЕГДА проверяем последнюю причину выключения (она могла быть записана)
+            last_shutdown = self._get_last_shutdown_reason(actor_id)
+            if last_shutdown:
+                shutdown_type = last_shutdown['shutdown_type']
+                baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
+            
             self._start_new_lifecycle(actor_id, 'startup', 'active')
             return
 
-        # === КРЭШ: последнее состояние не 'off' (active/sleep зависли) ===
-        logger.warning("Detected unclean shutdown. Prompting for downtime reason.")
-        shutdown_type = self._prompt_shutdown_reason()
-        shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-
-        # 2. Закрыть зависшее состояние (active/sleep).
-        # FIX: Используем 'crash_recovery', так как 'crash' отсутствует в ENUM lifecycle_change_reason
-        if last['ended_at'] is None:
-            self._close_current_lifecycle(actor_id, shutdown_id)
-
-        # 3. Вставить состояние 'off' задним числом (на время простоя)
-        downtime_start = last['ended_at'] or last['started_at']
-        self._insert_off_state(actor_id, downtime_start, datetime.now(timezone.utc), shutdown_id)
-
-        # 4. Создать новое 'active'
+        # 5. Любое другое состояние (например, sleep) – просто активируем
         self._start_new_lifecycle(actor_id, 'startup', 'active')
 
     def handle_graceful_shutdown(self, exit_reason: str):

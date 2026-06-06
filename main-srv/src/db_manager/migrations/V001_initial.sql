@@ -386,7 +386,8 @@ VALUES
     ('user_question_vectorize',     'Векторизация вопроса пользователя'),
     ('user_answer_vectorize',       'Векторизация ответа пользователю'),
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)'),
-    ('prompts_vectorize', 'Векторизация промптов')
+    ('prompts_vectorize', 'Векторизация промптов'),
+    ('phs_baseline_drift', 'Ежечасный естественный дрейф baseline ПГС')
 ON CONFLICT (type_name) DO NOTHING;
 
 
@@ -421,7 +422,8 @@ VALUES
     ('user_question_vectorize',     'Векторизация вопроса пользователя', '1.0.0'),
     ('user_answer_vectorize',       'Векторизация ответа пользователю', '1.0.0'),
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)', '1.0.0'),
-    ('prompts_vectorize',           'Векторизация промпта', '1.0.0')
+    ('prompts_vectorize',           'Векторизация промпта', '1.0.0'),
+    ('phs_baseline_drift', 'Ежечасный естественный дрейф baseline ПГС', '1.2.0')
 ON CONFLICT (step_name) DO NOTHING;
 
 

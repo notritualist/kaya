@@ -17,13 +17,14 @@ from orchestrator.orchestrator import start_orchestrator
 start_orchestrator() # starts a background thread
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
 import time
 import logging
 import psycopg2
+from typing import Dict, Callable
 from psycopg2.extras import RealDictCursor
 
 # Локальные импорты
@@ -152,6 +153,33 @@ def _handle_answer_generation(task_id: str, input_data: dict) -> None:
         with _composer_lock:
             _composer_busy = False
 
+def _get_task_type_name(db_config: dict, task_id: str) -> str:
+    """Возвращает type_name задачи по её ID."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tt.type_name
+                FROM orchestrator.orchestrator_tasks t
+                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                WHERE t.id = %s
+            """, (task_id,))
+            row = cur.fetchone()
+            return row[0] if row else "unknown"
+        
+#  Функция дрейфа PHS
+def _handle_phs_drift(task_id: str, input_data: dict):
+    global _composer_busy
+    try:
+        from phs_service.baseline_manager import BaselineManager
+        mgr = BaselineManager(load_postgres_config())
+        mgr.handle_drift_task(task_id, input_data)
+    except Exception as e:
+        logger.exception("PHS drift task failed")
+        complete_task_error(task_id, "phs_service", str(e))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
 
 def _orchestrator_loop():
     """
@@ -169,23 +197,40 @@ def _orchestrator_loop():
         try:
             if not _composer_busy:
                 task = _get_pending_task(db_config, "user_answer_generation")
+                if not task:
+                    task = _get_pending_task(db_config, "phs_baseline_drift")
+
                 if task:
                     task_id = task["id"]
                     input_data = task["input_data"]
+                    task_type = _get_task_type_name(db_config, task_id)
 
-                    mark_task_running(task_id=task_id)
+                    mark_task_running(task_id)
 
                     with _composer_lock:
                         _composer_busy = True
 
+                    # Маппинг типов → обработчиков
+                    handlers: Dict[str, Callable] = {
+                        "user_answer_generation": _handle_answer_generation,
+                        "phs_baseline_drift": _handle_phs_drift,
+                    }
+
+                    target = handlers.get(task_type)
+                    if not target:
+                        complete_task_error(task_id, "orchestrator", f"Unknown task type: {task_type}")
+                        with _composer_lock:
+                            _composer_busy = False
+                        continue
+
                     threading.Thread(
-                        target=_handle_answer_generation,
+                        target=target,
                         args=(task_id, input_data),
                         daemon=True,
-                        name=f"Composer-{task_id[:8]}"
+                        name=f"Orch-{task_type[:10]}-{task_id[:8]}"
                     ).start()
 
-                    logger.debug("Launched answer generation task: %s", task_id[:8])
+                    logger.debug(f"Launched task {task_type}: {task_id[:8]}")
 
             time.sleep(PULSE_SECONDS)
 
