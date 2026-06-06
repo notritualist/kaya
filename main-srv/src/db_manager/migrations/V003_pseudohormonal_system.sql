@@ -116,8 +116,10 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     -- Коэффициенты осаждения в baseline (α)
     ('alpha_session_end',  0.2,    NULL, NULL, 'Вес финального momentary при осаждении в baseline после завершения сессии.'),
     ('alpha_hourly_drift', 0.2,   NULL, NULL, 'Микро-осаждение текущего momentary в baseline каждый час активности.'),
-    -- Порог бездействия для перехода в sleep (минуты)
-    ('inactivity_sleep_minutes', 5.0, NULL, NULL, 'Число минут без сообщений пользователя, после которых агент переходит из active в sleep.'),
+    -- Порогb бездействия для перехода в sleep (минуты)
+    ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователя, после которых агент переходит из active в sleep.'),
+    ('dialogue_inactivity_timeout_minutes', 20.0, NULL, NULL, 'Таймаут неактивности диалога в минутах для пользователя. Если last_activity_at старше порога, 
+    диалог закрывается и создаётся новый.'),
     -- Параметры RFF (Random Fourier Features)
     ('rff_sigma', NULL, NULL, NULL, 'Явный параметр sigma для RFF. Если задан, имеет приоритет над вычислением из gamma.'),
     ('rff_gamma',          0.1,    NULL, NULL, 'Параметр gamma для RBF-ядра RFF. Используется для вычисления sigma = 1/sqrt(2*gamma), если rff_sigma не задан.'),
@@ -328,7 +330,7 @@ CREATE TABLE IF NOT EXISTS state.agent_lifecycle (
 
 COMMENT ON TABLE state.agent_lifecycle IS 'История состояний off/sleep/active.';
 COMMENT ON COLUMN state.agent_lifecycle.id IS 'UUID';
-COMMENT ON COLUMN state.shutdown_reasons.actor_id IS 'Пользователь, чьё действие вызвало изменение состояния.';
+COMMENT ON COLUMN state.agent_lifecycle.actor_id IS 'Пользователь, чьё действие вызвало изменение состояния.';
 COMMENT ON COLUMN state.agent_lifecycle.state_type IS 'Состояние: off, sleep, active';
 COMMENT ON COLUMN state.agent_lifecycle.started_at IS 'Время начала состояния';
 COMMENT ON COLUMN state.agent_lifecycle.ended_at IS 'Время окончания состояния (NULL – текущее)';
@@ -338,7 +340,8 @@ COMMENT ON COLUMN state.agent_lifecycle.created_at IS 'Дата создания
 COMMENT ON COLUMN state.agent_lifecycle.updated_at IS 'Дата обновления (триггер)';
 COMMENT ON COLUMN state.agent_lifecycle.agent_version IS 'Версия агента, под которой было начато данное состояние жизненного цикла.';
 
-CREATE UNIQUE INDEX lifecycle_active_per_actor ON state.agent_lifecycle (actor_id) WHERE ended_at IS NULL;
+CREATE UNIQUE INDEX lifecycle_active_global ON state.agent_lifecycle ((true)) WHERE ended_at IS NULL;
+COMMENT ON INDEX state.lifecycle_active_global IS 'Гарантирует единственную активную запись lifecycle глобально (ended_at IS NULL)';
 CREATE INDEX idx_lifecycle_started ON state.agent_lifecycle (started_at DESC);
 
 DROP TRIGGER IF EXISTS trigger_agent_lifecycle_updated_at ON state.agent_lifecycle;

@@ -1,23 +1,17 @@
 """
 main-srv/src/orchestrator/orchestrator.py
 
-The main loop of the AGI task orchestrator.
-The current implementation supports only one task type:
-- user_answer_generation — generating the final user response.
+Main loop of the AGI task orchestrator.
 
-Architectural principles:
-- Singleton loop: one background thread per application.
-- Safe task retrieval via FOR UPDATE SKIP LOCKED.
-- Concurrency control: only one generation can be running at a time.
-- Fault tolerance: errors are logged, but the loop is not terminated.
-- Hanging tasks are cleared at startup.
-
-Startup example:
-from orchestrator.orchestrator import start_orchestrator
-start_orchestrator() # starts a background thread
+Features:
+- Singleton background thread
+- Safe task retrieval via FOR UPDATE SKIP LOCKED
+- Concurrency control: one generation at a time
+- Fault tolerance: errors logged, loop continues
+- Lifecycle integration: check_inactivity on each pulse
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
@@ -30,6 +24,8 @@ from psycopg2.extras import RealDictCursor
 # Локальные импорты
 from db_manager.db_manager import load_postgres_config
 from services.service_metrics import mark_task_running, complete_task_error
+from phs_service.lifecycle_manager import LifecycleManager
+from dialog_services.dialogue_manager import check_dialogue_timeouts
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +91,9 @@ def _cleanup_dangling_records(db_config: dict):
             conn.commit()
 
             if tasks_count > 0:
-                logger.warning("🔄 Cleared %d dangling tasks on startup", tasks_count)
+                logger.warning("Cleared %d dangling tasks on startup", tasks_count)
             if steps_count > 0:
-                logger.warning("🔄 Cleared %d dangling steps on startup", steps_count)
+                logger.warning("Cleared %d dangling steps on startup", steps_count)
             
 
 def _get_pending_task(db_config: dict, task_type_name: str):
@@ -183,18 +179,28 @@ def _handle_phs_drift(task_id: str, input_data: dict):
 
 def _orchestrator_loop():
     """
-    Основной цикл оркестратора.
-    Работает в фоновом потоке.
-    На каждом "пульсе" проверяет очередь задач генерации ответа.
-    Если есть задача и композер свободен — запускает её в новом потоке.
+     Основной цикл оркестратора.
+    
+    На каждом пульсе:
+    1. Проверяет таймаут бездействия (lifecycle check_inactivity)
+    2. Извлекает задачу из очереди
+    3. Проверяет таймауты диалогов и закрывает просроченные.
+    4. Запускает обработчик в отдельном потоке
     """
     global _composer_busy, _running
 
     db_config = load_postgres_config()
+    # Инициализация lifecycle manager
+    lifecycle_mgr = LifecycleManager(db_config)
+
     logger.info("Orchestrator started. Pulse interval: %d second(s)", PULSE_SECONDS)
 
     while _running:
         try:
+            # === ПРОВЕРКА ТАЙМАУТОВ ===
+            lifecycle_mgr.check_inactivity()
+            check_dialogue_timeouts(db_config)
+            
             if not _composer_busy:
                 task = _get_pending_task(db_config, "user_answer_generation")
                 if not task:

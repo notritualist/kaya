@@ -1,6 +1,20 @@
-"""/main-srv/src/main.py"""
+"""
+/main-srv/src/main.py
 
-__version__ = "1.2.0"
+Main launch module of agent.
+
+Sequence:
+1. Logging setup
+2. Postgres schema check
+3. Qdrant collections check
+4. Cleanup dangling sessions
+5. Start orchestrator
+6. Start PHS scheduler
+7. Initialize LifecycleManager
+8. Run console interface with lifecycle integration
+"""
+
+__version__ = "1.2.1"
 __description__ = "Main launch module of agent"
 
 import sys
@@ -11,10 +25,17 @@ from db_manager.db_manager import load_postgres_config, ensure_postgres_schema_r
 from interfaces.console_interface import run_console_interface
 from orchestrator.orchestrator import start_orchestrator
 from session_services.session_manager import SessionManager
+from phs_service.lifecycle_manager import LifecycleManager
 
 
 def setup_logging():
-    """Настройка глобального логирования с фильтрацией"""
+    """
+    Настройка глобального логирования с фильтрацией.
+    
+    Создаёт логгер с двумя handlers:
+    - Файловый: DEBUG и выше в logs/agent_full.log
+    - Консольный: WARNING и выше в stdout
+    """
     project_root = Path(__file__).parent.parent
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -63,7 +84,8 @@ def main():
     4. Очистка зависших после рестарта сессий пользователей
     5. Запуск цикла оркестратора
     6. Запуск планировщика ПГС
-    7. Запуск консольного интерфейса с управлением сессиями
+    7. Инициализация LifecycleManager
+    8. Запуск консольного интерфейса с передачей lifecycle_mgr
     """
     # Инициализация логгирования
     success = False
@@ -94,13 +116,16 @@ def main():
         # 5. Запуск цикла оркестратора
         start_orchestrator()
 
-        # 6. Запуск планировщика ПГС ===
+        # 6. Запуск планировщика ПГС
         from phs_service.phs_scheduler import PHSScheduler
         phs_scheduler = PHSScheduler()
         phs_scheduler.start()
         
+        # 7. Инициализация LifecycleManager
+        lifecycle_mgr = LifecycleManager(postgres_config)
+
         # 7. Запуск консольного интерфейса с передачей конфига БД и версии агента
-        run_console_interface(postgres_config, agent_version)
+        run_console_interface(postgres_config, agent_version, lifecycle_mgr)
 
                 
     except Exception as e:

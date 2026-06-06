@@ -2,21 +2,26 @@
 main-srv/src/orchestrator/orchestrator_entry.py
 
 Orchestrator input interface.
+
 Called from session_manager after saving the user's message.
 Creates a task to generate the final answer (user_answer_generation).
+Records user activity for global lifecycle state.
 
 Architectural requirements:
-- Only one task: user_answer_generation.
-- All data is taken from existing Postgres tables.
-- The agent version is passed globally.
+- Only one task type: user_answer_generation
+- All data from existing Postgres tables
+- Lifecycle activity recorded with actor_id from message
+- Agent version passed globally
 """
 
-__version__ = "1.0.0"
-__description__ = "Entry point for orchestrator: create final answer generation task"
+__version__ = "1.1.0"
+__description__ = "Entry point for orchestrator"
 
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+from phs_service.lifecycle_manager import LifecycleManager
+from phs_service.lifecycle_manager import LifecycleManager
 
 # Глобальная версия проекта (из pyproject.toml через version.py)
 from version import __version__ as agent_version
@@ -26,18 +31,24 @@ logger = logging.getLogger(__name__)
 
 def on_user_message(message_id: str) -> str:
     """
-    Создаёт задачу оркестратору на генерацию финального ответа пользователю.
-
+   Создаёт задачу оркестратору и фиксирует активность для lifecycle.
+    
+    Логика:
+    1. Валидация message_id
+    2. Загрузка actor_id из dialogs.row_messages
+    3. Фиксация активности через LifecycleManager.record_activity
+    4. Создание задачи user_answer_generation
+    
     Args:
-        message_id (str): UUID сообщения из dialogs.row_messages
-
+        message_id: UUID сообщения из dialogs.row_messages
+    
     Returns:
         str: UUID созданной задачи в orchestrator.orchestrator_tasks
-
+    
     Raises:
         ValueError: если message_id пустой или недействительный
-        RuntimeError: если тип задачи не найден в БД
-        psycopg2.Error: при ошибках работы с базой данных
+        RuntimeError: если сообщение или тип задачи не найдены
+        psycopg2.Error: при ошибках БД
     """
     if not message_id or not isinstance(message_id, str):
         raise ValueError("message_id must be a non-empty string")
@@ -47,13 +58,27 @@ def on_user_message(message_id: str) -> str:
     conn = None
 
     try:
-        conn = psycopg2.connect(**db_config)
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1. Получаем ID типа задачи 'user_answer_generation'
-            cur.execute("""
-                SELECT id FROM orchestrator.task_types 
-                WHERE type_name = %s
-            """, ("user_answer_generation",))
+       conn = psycopg2.connect(**db_config)
+       with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # === 1. Получаем actor_id из сообщения ===
+            cur.execute(
+                "SELECT actor_id FROM dialogs.row_messages WHERE id = %s",
+                (message_id,)
+            )
+            msg_row = cur.fetchone()
+            if not msg_row:
+                raise RuntimeError(f"Message {message_id} not found in dialogs.row_messages")
+            actor_id = str(msg_row['actor_id'])
+
+            # === 2. Фиксируем активность для lifecycle ===
+            lifecycle_mgr = LifecycleManager(db_config)
+            lifecycle_mgr.record_activity(actor_id, 'user_activity')
+
+            # === 3. Получаем ID типа задачи ===
+            cur.execute(
+                "SELECT id FROM orchestrator.task_types WHERE type_name = %s",
+                ("user_answer_generation",)
+            )
             row = cur.fetchone()
             if not row:
                 raise RuntimeError(
@@ -62,7 +87,7 @@ def on_user_message(message_id: str) -> str:
                 )
             task_type_id = row["id"]
 
-            # 2. Создаём задачу с приоритетом 0.7
+            # === 4. Создаём задачу ===
             priority = 0.7
 
             cur.execute("""
@@ -94,7 +119,8 @@ def on_user_message(message_id: str) -> str:
 
             logger.info(
                 f"Orchestrator task created: task_id={task_id[:8]}..., "
-                f"message_id={message_id[:8]}..., priority={priority}"
+                f"message_id={message_id[:8]}..., priority={priority}, "
+                f"activity recorded for actor {actor_id[:8]}"
             )
             return task_id
 

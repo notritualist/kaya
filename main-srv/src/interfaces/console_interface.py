@@ -1,19 +1,21 @@
 """
 main-srv/src/interfaces/console_interface.py
 
-A console interface for dialog with an AGI agent.
-With multi-line input support (Shift+Enter = new line, Enter = send).
-Operational logic:
-On startup, determines the current OS user (Linux).
-Binds it to an 'owner' actor in the database (if not already bound).
-Creates a NEW dialog session (each launch = a separate session).
-Starts a cycle: user input → save to database → wait for response → exit.
-On exit (exit / Ctrl+D), gracefully closes the database session.
+Console interface for dialog with an AGI agent.
+
+Features:
+- Multi-line input (Shift+Enter = new line, Enter = send)
+- Ctrl+N = New dialogue (rotate_dialogue)
+- Ctrl+D = Graceful exit
+- Automatic binding of OS user to actor (owner/user)
+- Session management via SessionManager
+- Lifecycle integration: startup/shutdown with actor_id
+
 DB schema: dialogs.sessions, dialogs.row_messages, users.actors, users.actors_external_ids
 Migration version: V001
 """
 
-version = "1.1.1"
+version = "1.2.0"
 description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
@@ -24,7 +26,7 @@ from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-
+from phs_service.lifecycle_manager import LifecycleManager
 
 # Получаем логгер для этого модуля
 logger = logging.getLogger(__name__)
@@ -59,7 +61,6 @@ def _print_status(message: str, is_success: bool):
     COLOR_RESET = "\033[0m"
     symbol = "✓" if is_success else "✗"
     color = COLOR_GREEN if is_success else COLOR_RED
-
     print(f"{color}[{symbol}] {message}{COLOR_RESET}")
 
 def create_prompt_session(session_manager: SessionManager) -> PromptSession:
@@ -125,12 +126,13 @@ def get_user_input(session: PromptSession) -> str:
     except (EOFError, KeyboardInterrupt):
         raise KeyboardInterrupt()
 
-def run_console_interface(db_config: dict, agent_version: str):
+def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: LifecycleManager):
     """
     Главная точка входа для консольного интерфейса.
     Args:
         db_config: словарь с параметрами подключения к PostgreSQL
         agent_version: строка версии агента из pyproject.toml
+        lifecycle_mgr: экземпляр LifecycleManager для управления состоянием агента
     """
 
     # === ШАГ 1: Инициализация ===
@@ -164,11 +166,10 @@ def run_console_interface(db_config: dict, agent_version: str):
         # === ШАГ 5.1: Создаём сессию ввода с привязкой менеджера (для Ctrl+N) ===
         prompt_session = create_prompt_session(session_service)
 
-        # === ШАГ 5.2 --- PHS Lifecycle Initialization (after actor and session is guaranteed to exist) ---
-        # Запуск уточнения причины завершения работы для псевдогормональной системы
-        from phs_service.lifecycle_manager import LifecycleManager
-        lifecycle_mgr = LifecycleManager(db_config)
-        lifecycle_mgr.handle_startup()
+        # === ШАГ 5.2 === PHS Lifecycle Initialization (Вызываем после того, как actor_id гарантированно определён) ===
+        # Гарантируем, что actor_id установлен (после ensure_actor_linked/create_session это всегда так)
+        assert session_service.actor_id is not None, "actor_id must be set after ensure_actor_linked"
+        lifecycle_mgr.handle_startup(session_service.actor_id)
 
         # === ШАГ 6: Основной цикл диалога ===
         while True:
@@ -243,14 +244,10 @@ def run_console_interface(db_config: dict, agent_version: str):
     finally:
         logger.info(f"Closing dialog session with reason: {exit_reason}")
        
-        # --- PHS Graceful Shutdown ---
-        from phs_service.lifecycle_manager import LifecycleManager
-
-        lifecycle_mgr = LifecycleManager(db_config)
-        actor_id = session_service.actor_id  # или вызвать _get_current_actor_id()
+        # === PHS Graceful Shutdown ===
         if exit_reason in ("user_command", "user_exit"):
-            # Но handle_graceful_shutdown уже сам получает actor_id — ок!
-            lifecycle_mgr.handle_graceful_shutdown(exit_reason)
+            assert session_service.actor_id is not None, "actor_id must be set for graceful shutdown"
+            lifecycle_mgr.handle_graceful_shutdown(session_service.actor_id, exit_reason)
                 
         session_service.close_session(reason=exit_reason)
         _print_status("Session completed. Data saved to DB.", True)

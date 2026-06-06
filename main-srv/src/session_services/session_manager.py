@@ -18,7 +18,7 @@ DB schema: migration V002, migration V002
 Tables: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.dialogues, dialogs.row_messages
 """
 
-version = "1.0.1"
+version = "1.1.0"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -253,6 +253,35 @@ class SessionManager:
             logger.error(f"Error closing dangling sessions: {e}", exc_info=True)
             return 0        
 
+    def _calculate_sleep_duration(self) -> Optional[str]:
+        """
+        Вычисляет длительность простоя с момента завершения последней сессии актора.
+        
+        Returns:
+            str | None: интервал в формате PostgreSQL INTERVAL или None
+        """
+        if not self.actor_id:
+            return None
+        
+        try:
+            row = self._query("""
+                SELECT closed_at
+                FROM dialogs.sessions
+                WHERE actor_id = %s AND status = 'completed'
+                ORDER BY closed_at DESC
+                LIMIT 1
+            """, params=(self.actor_id,), fetch=True)
+            
+            if not row or row['closed_at'] is None:
+                return None
+            
+            # PostgreSQL интервал вычисляется автоматически при UPDATE
+            return "NOW() - %s::timestamptz"  # Не работает через параметр
+            # Лучше вернуть timestamp и вычислить в SQL
+        except Exception:
+            return None
+    
+    
     def create_session(self) -> str:
         """
         Создаёт новую физическую сессию диалога (dialogs.sessions).
@@ -275,26 +304,44 @@ class SessionManager:
         logger.info(f"Creating new session")
         
         try:
-            # === ЗАПРОС 1: Создаём сессию ===
-            row = self._query("""
+            # === ВЫЧИСЛЯЕМ SLEEP_DURATION ===
+            last_closed = self._query("""
+                SELECT closed_at
+                FROM dialogs.sessions
+                WHERE actor_id = %s AND status = 'completed'
+                ORDER BY closed_at DESC
+                LIMIT 1
+            """, params=(self.actor_id,), fetch=True)
+            
+            sleep_duration_expr = "NULL"
+            sleep_params = []
+            if last_closed and last_closed['closed_at']:
+                sleep_duration_expr = "NOW() - %s::timestamptz"
+                sleep_params = [last_closed['closed_at']]
+            
+            # === Создаём сессию ===
+            row = self._query(f"""
                 INSERT INTO dialogs.sessions 
                 (
                     actor_id, 
                     actor_external_id, 
                     status, 
-                    agent_version
+                    agent_version,
+                    sleep_duration
                 )
                 VALUES (
                     %s, 
                     %s, 
                     'active', 
-                    %s
+                    %s,
+                    {sleep_duration_expr}
                 )
                 RETURNING id
             """, params=(
                 self.actor_id,
                 self.actor_external_id,
-                self.agent_version
+                self.agent_version,
+                *sleep_params
             ), fetch=True)
             
             if not row:

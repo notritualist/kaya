@@ -1,13 +1,18 @@
 """
 main-srv/src/phs_service/lifecycle_manager.py
-A service module for managing the agent's pseudohormonal lifecycle states.
-Version: 1.1.0
-Fixes:
-- Correctly handles open 'off' state on startup (graceful shutdown detection).
-- Fixed invalid enum value 'crash' -> 'crash_recovery'.
+
+Global Agent Lifecycle Management within the PHS Framework.
+
+Principles:
+    The agent state (off/sleep/active) is UNIFIED across the entire system.
+    The actor_id field records the INITIATOR of a change but does not create separate states.
+    The orchestrator is the source of truth for timeout‑driven transitions.
+    The PHS logic (baseline drift during shutdown/crash) is fully preserved.
+    Handle_startup guarantees closing ANY stuck record (active/sleep/off).
 """
-version = "1.0.0"
-description = "Pseudohormonal lifecycle state manager"
+version = "1.1.0"
+description = "Global agent lifecycle manager"
+
 import logging
 from datetime import datetime, timezone
 import psycopg2
@@ -31,263 +36,68 @@ class LifecycleManager:
         """
         self.db_config = db_config
 
-    def _get_current_lifecycle(self, actor_id: str) -> dict | None:
+    # =========================================================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (ГЛОБАЛЬНЫЕ)
+    # =========================================================================
+
+    def _get_global_lifecycle(self) -> dict | None:
         """
-        Возвращает текущее активное состояние из state.agent_lifecycle.
-        Returns:
-            dict | None: запись с ended_at = NULL или None
+        Возвращает текущее активное глобальное состояние.
+        ВАЖНО: Не фильтрует по actor_id — состояние едино для всех.
         """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT id, state_type, started_at
+                    SELECT id, state_type, started_at, updated_at, actor_id, shutdown_reason_id
                     FROM state.agent_lifecycle
-                    WHERE actor_id = %s AND ended_at IS NULL
-                """, (actor_id,))
+                    WHERE ended_at IS NULL
+                    LIMIT 1
+                """)
                 return cur.fetchone()
-        
-    def _get_last_lifecycle(self, actor_id: str) -> dict | None:
+
+    def _get_last_lifecycle(self) -> dict | None:
         """
-        Возвращает последнюю запись из state.agent_lifecycle для данного актора
-        (независимо от ended_at).
+        Возвращает последнюю запись lifecycle (по started_at DESC).
         """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT id, state_type, started_at, ended_at
+                    SELECT id, state_type, started_at, ended_at, actor_id, shutdown_reason_id
                     FROM state.agent_lifecycle
-                    WHERE actor_id = %s
                     ORDER BY started_at DESC
                     LIMIT 1
-                """, (actor_id,))
+                """)
                 return cur.fetchone()
-    
 
-    def _close_current_lifecycle(self, actor_id: str, reason: str, shutdown_id: str | None = None):
+    def _close_global_lifecycle(self, reason: str) -> None:
         """
-        Завершает текущее активное состояние в state.agent_lifecycle.
-        
-        ВАЖНО: reason_change не обновляется, так как это причина ВХОДА в состояние.
-        Она должна оставаться неизменной. Причина выхода фиксируется через shutdown_reason_id
-        или как reason_change следующей записи.
-        
-        :param shutdown_id: ссылка на state.shutdown_reasons.id (опционально)
+        Завершает текущее активное глобальное состояние.
+        ВАЖНО: Не обновляет shutdown_reason_id (только для off).
         """
-        current = self._get_current_lifecycle(actor_id)
+        current = self._get_global_lifecycle()
         if not current:
             return
 
         with psycopg2.connect(**self.db_config) as conn:
-            current = self._get_current_lifecycle(actor_id)
-            if not current: return
-            with psycopg2.connect(**self.db_config) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE state.agent_lifecycle
-                        SET ended_at = %s, shutdown_reason_id = %s
-                        WHERE id = %s
-                    """, (datetime.now(timezone.utc), shutdown_id, current['id']))
-
-    def _get_current_actor_id(self) -> str:
-        """Возвращает actor_id текущего пользователя консоли."""
-        import os, pwd
-        console_user_id = f"console:{pwd.getpwuid(os.getuid()).pw_name}"
-        with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT a.id
-                    FROM users.actors a
-                    JOIN users.actors_external_ids e ON a.id = e.actor_id
-                    WHERE e.source = 'console' AND e.source_id = %s
-                    LIMIT 1
-                """, (console_user_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise RuntimeError("Actor not found for console user")
-                return str(row[0])
-        
-
-    def _record_shutdown_reason(self, shutdown_type: str, actor_id: str) -> str:
-        """
-        Создаёт запись о причине выключения в state.shutdown_reasons.
-        :param shutdown_type: значение из ENUM state.shutdown_type
-        :param actor_id: UUID актора (пользователя)
-        :return: UUID новой записи
-        """
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    INSERT INTO state.shutdown_reasons (actor_id, shutdown_type, timestamp)
-                    VALUES (%s, %s, %s) RETURNING id
-                """, (actor_id, shutdown_type, datetime.now(timezone.utc)))
-                row = cur.fetchone()
-                logger.info(f"Recorded shutdown: type={shutdown_type}, actor={actor_id[:8]}")
-                return str(row['id'])
-
-    def _prompt_shutdown_reason(self) -> str:
-        """
-        Запрашивает у пользователя причину отключения через консоль.
-        Использует sys.stdin для совместимости с prompt_toolkit.
-        """
-        print("\nAgent was offline. Please specify the reason:")
-        reasons = {
-            'maintenance':      'Scheduled equipment maintenance',
-            'crash':            'Crash',
-            'forced_shutdown':  'Forced shutdown',
-            'user_absence':     'Long-term absence of the user',
-            'agent_modification': 'Agent refinement and testing'
-        }
-        for i, (enum_val, desc) in enumerate(reasons.items(), start=1):
-            print(f"  [{i}] {desc}")
-        
-        enum_list = list(reasons.keys())
-        
-        import sys
-        while True:
-            print("Your choice (1-5):  ", end=" ", flush=True)
-            choice = sys.stdin.readline().strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(enum_list):
-                selected_enum = enum_list[int(choice) - 1]
-                logger.info(f"Selected shutdown reason: {selected_enum}")
-                return selected_enum
-            print("Invalid choice. Please try again.")
-
-    def _insert_off_state(self, actor_id: str, started_at, ended_at, shutdown_id: str):
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO state.agent_lifecycle (
-                        actor_id, state_type, started_at, ended_at,
-                        reason_change, shutdown_reason_id, agent_version
-                    ) VALUES (
-                        %s, 'off', %s, %s, 'crash_recovery', %s, %s
-                    )
-                """, (actor_id, started_at, ended_at, shutdown_id, agent_version))
-    
-    def _create_phs_drift_task(self, drift_type: str, input_data: dict):
-        """Создаёт задачу phs_baseline_drift напрямую через SQL."""
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id FROM orchestrator.task_types WHERE type_name = 'phs_baseline_drift'")
-                task_type_id = cur.fetchone()["id"]
-                full_input = {"drift_type": drift_type, **input_data}
-                cur.execute("""
-                    INSERT INTO orchestrator.orchestrator_tasks (
-                        task_type_id, input_data, priority, status, agent_version, created_at
-                    ) VALUES (%s, %s, 0.3, 'pending', %s, NOW())
-                """, (task_type_id, Json(full_input), agent_version))
+                    UPDATE state.agent_lifecycle
+                    SET ended_at = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (datetime.now(timezone.utc), current['id']))
                 conn.commit()
-    
-    def _get_last_shutdown_reason(self, actor_id: str) -> Optional[Dict[str, Any]]:
-        """Возвращает последнюю запись из state.shutdown_reasons для актора."""
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT shutdown_type, timestamp
-                    FROM state.shutdown_reasons
-                    WHERE actor_id = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                """, (actor_id,))
-                return cur.fetchone()
+        logger.debug(f"Closed global lifecycle state: {current['state_type']} (id={current['id'][:8]})")
 
-    def handle_startup(self):
-        """Вызывается при запуске main.py. Обрабатывает восстановление после неграциозного завершения."""
-        logger.info("Starting pseudohormonal lifecycle recovery...")
-        actor_id = self._get_current_actor_id()
-
-        # === ШАГ 0: Инициализация baseline (если ещё не создан) ===
-        from phs_service.baseline_manager import BaselineManager
-        baseline_mgr = BaselineManager(self.db_config)
-        baseline_mgr.ensure_baseline_initialized()
-
-        # 1. Найти последнее состояние ДЛЯ ЭТОГО АКТОРА
-        last = self._get_last_lifecycle(actor_id)
-        
-        if last is None:
-            # Первый запуск – сразу создаём active
-            self._start_new_lifecycle(actor_id, 'startup', 'active')
-            return
-
-        # 2. Определяем, было ли незакрытое active (крэш) или штатное off
-        #    Вычисляем время начала простоя (downtime_start) и причину
-        if last['state_type'] == 'active' and last['ended_at'] is None:
-            # Оборванная сессия (крэш)
-            downtime_start = last['started_at']
-            is_crash = True
-        elif last['state_type'] == 'off':
-            # Штатное выключение: downtime_start = ended_at (если есть) или started_at
-            downtime_start = last['ended_at'] or last['started_at']
-            is_crash = False
-        else:
-            # Неожиданное состояние (например, sleep) – обрабатываем как обычный старт
-            downtime_start = last['started_at']
-            is_crash = False
-
-        downtime_duration = (datetime.now(timezone.utc) - downtime_start).total_seconds()
-
-        # 3. Обработка краша (если есть незакрытое active)
-        if is_crash:
-            logger.warning("Detected unclean shutdown. Prompting for downtime reason.")
-            shutdown_type = self._prompt_shutdown_reason()
-            shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-
-            # Применяем коррекцию baseline СРАЗУ
-            baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
-
-            # Закрываем зависшее активное состояние
-            self._close_current_lifecycle(actor_id, 'crash_recovery', shutdown_id)
-
-            # Вставляем состояние 'off' задним числом
-            self._insert_off_state(actor_id, downtime_start, datetime.now(timezone.utc), shutdown_id)
-
-            # Создаём новое 'active'
-            self._start_new_lifecycle(actor_id, 'startup', 'active')
-            return
-
-        # 4. Штатное выключение (последнее состояние было off)
-        if last['state_type'] == 'off':
-            # Если off не закрыт (rare), закрываем
-            if last['ended_at'] is None:
-                self._close_current_lifecycle(actor_id, 'startup', None)
-            
-            # ВСЕГДА проверяем последнюю причину выключения (она могла быть записана)
-            last_shutdown = self._get_last_shutdown_reason(actor_id)
-            if last_shutdown:
-                shutdown_type = last_shutdown['shutdown_type']
-                baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
-            
-            self._start_new_lifecycle(actor_id, 'startup', 'active')
-            return
-
-        # 5. Любое другое состояние (например, sleep) – просто активируем
-        self._start_new_lifecycle(actor_id, 'startup', 'active')
-
-    def handle_graceful_shutdown(self, exit_reason: str):
+    def _start_new_lifecycle(
+        self, 
+        actor_id: str, 
+        reason: str, 
+        state_type: str = 'active', 
+        shutdown_id: str | None = None
+    ) -> None:
         """
-        Вызывается при выходе через exit / Ctrl+D.
-        :param exit_reason: причина из dialogs.sessions.reason (user_command / user_exit)
-        """
-        logger.info(f"Handling graceful shutdown (reason: {exit_reason})...")
-        actor_id = self._get_current_actor_id()
-
-        shutdown_type = self._prompt_shutdown_reason()
-        shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-
-        # Закрываем active (только ended_at)
-        self._close_current_lifecycle(actor_id, shutdown_id)
-
-        # Создаём off и ПИШЕМ shutdown_reason_id ТУДА, как требует схема
-        self._start_new_lifecycle(actor_id, 'shutdown_command', 'off', shutdown_id)
-        logger.info("Graceful shutdown completed.")
-
-    
-    def _start_new_lifecycle(self, actor_id: str, reason: str, state_type: str = 'active', shutdown_id: str | None = None):
-        """
-        Создаёт новую запись в state.agent_lifecycle.
-        :param actor_id: UUID актора (владельца консоли)
-        :param reason: причина из ENUM state.lifecycle_change_reason
-        :param state_type: состояние из ENUM state.agent_state_type (по умолчанию 'active')
+        Создаёт новую запись глобального состояния.
+        shutdown_id допустим только для state_type='off'.
         """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
@@ -298,4 +108,217 @@ class LifecycleManager:
                         %s, %s::state.agent_state_type, %s::state.lifecycle_change_reason, %s, %s
                     )
                 """, (actor_id, state_type, reason, shutdown_id, agent_version))
-                logger.info(f"Started new lifecycle for actor {actor_id[:8]}: {state_type} ({reason})")
+                conn.commit()
+        logger.info(
+            f"Started new global lifecycle: {state_type} ({reason}), "
+            f"initiated by actor {actor_id[:8]}"
+        )
+
+    def _convert_to_off(
+        self, 
+        record_id: str, 
+        shutdown_id: str, 
+        ended_at: datetime
+    ) -> None:
+        """
+        Конвертирует существующую запись в состояние off.
+        
+        Используется при crash recovery для устранения дублирования:
+        вместо закрытия active/sleep и вставки новой off, обновляем запись на месте.
+        
+        Args:
+            record_id: ID записи для конвертации
+            shutdown_id: ссылка на state.shutdown_reasons.id
+            ended_at: время завершения (обычно NOW())
+        """
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE state.agent_lifecycle
+                    SET 
+                        state_type = 'off',
+                        reason_change = 'crash_recovery',
+                        ended_at = %s,
+                        shutdown_reason_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (ended_at, shutdown_id, record_id))
+                conn.commit()
+        logger.debug(f"Converted lifecycle record {record_id[:8]} to off (crash_recovery)")
+
+    def _get_inactivity_sleep_minutes(self) -> float:
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT value_float FROM state.settings 
+                    WHERE param_name = 'inactivity_sleep_minutes'
+                """)
+                row = cur.fetchone()
+                if not row or row[0] is None:
+                    return 5.0
+                return float(row[0])
+
+    # =========================================================================
+    # ПУБЛИЧНЫЕ МЕТОДЫ ДЛЯ ОРКЕСТРАТОРА
+    # =========================================================================
+
+    def record_activity(self, actor_id: str, reason: str = 'user_activity') -> None:
+        current = self._get_global_lifecycle()
+        if not current:
+            self._start_new_lifecycle(actor_id, reason, 'active')
+            return
+
+        if current['state_type'] == 'sleep':
+            wake_reason = 'user_wake_up' if reason == 'user_activity' else 'agent_wake_up'
+            self._close_global_lifecycle(wake_reason)
+            self._start_new_lifecycle(actor_id, wake_reason, 'active')
+        else:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE state.agent_lifecycle
+                        SET updated_at = NOW()
+                        WHERE id = %s
+                    """, (current['id'],))
+                    conn.commit()
+            logger.debug(f"Activity recorded by {actor_id[:8]}, state remains active")
+
+    def check_inactivity(self) -> None:
+        current = self._get_global_lifecycle()
+        if not current or current['state_type'] != 'active':
+            return
+
+        now = datetime.now(timezone.utc)
+        last_activity = current['updated_at']
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+
+        elapsed_sec = (now - last_activity).total_seconds()
+        threshold_sec = self._get_inactivity_sleep_minutes() * 60
+
+        if elapsed_sec > threshold_sec:
+            logger.info(
+                f"Inactivity timeout: {elapsed_sec:.1f}s > {threshold_sec:.0f}s. "
+                f"Transitioning active → sleep"
+            )
+            self._close_global_lifecycle('inactivity_timeout')
+            self._start_new_lifecycle(current['actor_id'], 'inactivity_timeout', 'sleep')
+
+    # =========================================================================
+    # PHS: STARTUP / SHUTDOWN
+    # =========================================================================
+
+    def _record_shutdown_reason(self, shutdown_type: str, actor_id: str) -> str:
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    INSERT INTO state.shutdown_reasons (actor_id, shutdown_type, timestamp)
+                    VALUES (%s, %s, %s) RETURNING id
+                """, (actor_id, shutdown_type, datetime.now(timezone.utc)))
+                row = cur.fetchone()
+                return str(row['id'])
+
+    def _prompt_shutdown_reason(self) -> str:
+        print("\nAgent was offline. Please specify the reason:")
+        reasons = {
+            'maintenance': 'Scheduled equipment maintenance',
+            'crash': 'Crash',
+            'forced_shutdown': 'Forced shutdown',
+            'user_absence': 'Long-term absence of the user',
+            'agent_modification': 'Agent refinement and testing'
+        }
+        for i, (enum_val, desc) in enumerate(reasons.items(), start=1):
+            print(f"  [{i}] {desc}")
+
+        enum_list = list(reasons.keys())
+        import sys
+        while True:
+            print("Your choice (1-5):   ", end="  ", flush=True)
+            choice = sys.stdin.readline().strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(enum_list):
+                return enum_list[int(choice) - 1]
+            print("Invalid choice. Please try again.")
+
+    def _get_shutdown_type_by_id(self, shutdown_id: str) -> Optional[str]:
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT shutdown_type FROM state.shutdown_reasons WHERE id = %s
+                """, (shutdown_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def handle_startup(self, actor_id: str) -> None:
+        """
+        Вызывается при запуске. Корректно различает штатный старт и креш.
+        
+        Логика:
+        1. Если есть запись с ended_at=NULL:
+           - state_type='off' → штатный старт. Закрываем off, применяем дрейф, стартуем active.
+           - state_type='active'/'sleep' → креш. Запрашиваем причину, применяем дрейф,
+             КОНВЕРТИРУЕМ запись в off (без дублирования), стартуем active.
+        2. Если нет активной записи → стартуем active.
+        """
+        logger.info("Starting pseudohormonal lifecycle recovery...")
+
+        from phs_service.baseline_manager import BaselineManager
+        baseline_mgr = BaselineManager(self.db_config)
+        baseline_mgr.ensure_baseline_initialized()
+
+        current = self._get_global_lifecycle()
+
+        if current is None:
+            self._start_new_lifecycle(actor_id, 'startup', 'active')
+            return
+
+        state_type = current['state_type']
+        downtime_start = current['started_at']
+        downtime_duration = (datetime.now(timezone.utc) - downtime_start).total_seconds()
+        now = datetime.now(timezone.utc)
+
+        # === ИСПРАВЛЕНИЕ: off с ended_at=NULL — это штатное выключение ===
+        if state_type == 'off':
+            logger.info(
+                f"Detected graceful shutdown state: off (id={current['id'][:8]}). "
+                f"Closing and starting active."
+            )
+
+            shutdown_id = current.get('shutdown_reason_id')
+            shutdown_type = None
+            if shutdown_id:
+                shutdown_type = self._get_shutdown_type_by_id(shutdown_id)
+            
+            if shutdown_type:
+                baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
+            else:
+                logger.warning("No shutdown_reason_id in off state, skipping drift.")
+
+            self._close_global_lifecycle('startup')
+            self._start_new_lifecycle(actor_id, 'startup', 'active')
+            return
+
+        # === active или sleep с ended_at=NULL — это креш ===
+        logger.warning(
+            f"Detected dangling lifecycle state: {state_type} (id={current['id'][:8]}). "
+            f"Treating as crash/kill."
+        )
+
+        shutdown_type = self._prompt_shutdown_reason()
+        shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
+
+        baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
+
+        # ИСПРАВЛЕНИЕ: Конвертируем запись в off вместо дублирования
+        self._convert_to_off(current['id'], shutdown_id, now)
+
+        self._start_new_lifecycle(actor_id, 'startup', 'active')
+
+    def handle_graceful_shutdown(self, actor_id: str, exit_reason: str) -> None:
+        logger.info(f"Handling graceful shutdown (reason: {exit_reason})...")
+
+        shutdown_type = self._prompt_shutdown_reason()
+        shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
+
+        self._close_global_lifecycle('shutdown_command')
+        self._start_new_lifecycle(actor_id, 'shutdown_command', 'off', shutdown_id)
+        logger.info("Graceful shutdown completed.")
