@@ -27,7 +27,7 @@ agent/
 │    │   ├── CMakeLists.txt
 │    │   ├── Makefile
 │    │   ├── build/               # Built binaries (ignored by git)
-│    │   └── ...                  # llama.cpp source files
+│    │   └── ...                  # llama.cpp sources
 │    │
 │    ├── logs/                   # Agent operation logs
 │    │   └── kaya_full.log        # Full log (DEBUG+)
@@ -39,11 +39,11 @@ agent/
 │    ├── requirements.txt        # .venv dependencies file (main-srv)
 │    │
 │    ├── scripts/
-│    │   └── start_llama-server.sh # Script to start llama-server (API)
+│    │   └── start_llama-server.sh # Launch llama-server (API)
 │    │
-│    └── src/                    # Python source code
+│    └── src/                     # Python source code
 │        ├── __init__.py
-│        ├── main.py              # Entry point (agent startup)
+│        ├── main.py              # Entry point (agent launch)
 │        ├── version.py           # Global version from pyproject.toml
 │        │
 │        ├── db_manager/          # Database management
@@ -51,14 +51,14 @@ agent/
 │        │   ├── db_manager.py    # PostgreSQL connection
 │        │   └── migrations/
 │        │       ├── __init__.py
-│        │       ├── pg_migration_manager.py         # Migration application manager
-│        │       ├── V001_initial.sql                # Initial schema (main agent tables)
-│        │       ├── V002_dialogues.sql              # Dialogue layer schema
+│        │       ├── pg_migration_manager.py         # DB migration manager
+│        │       ├── V001_initial.sql                # Initial schema (core agent tables)
+│        │       ├── V002_dialogues.sql              # Dialog layer schema
 │        │       └── V003_pseudohormonal_system.sql  # PHS schema: baseline, momentary, lifecycle, self_knowledge
 │        │
-│        ├── dialog_services/     # Dialogue lifecycle management
+│        ├── dialog_services/     # Dialog lifecycle management
 │        │   ├── __init__.py
-│        │   └── dialogue_manager.py  # Dialogue manager (creation/closure, timeouts)
+│        │   └── dialogue_manager.py  # Dialog manager (creation/closing, timeouts)
 │        │
 │        ├── interfaces/          # Interfaces
 │        │   ├── __init__.py
@@ -66,7 +66,7 @@ agent/
 │        │
 │        ├── model_service/       # LLM access abstraction with routing
 │        │   ├── __init__.py
-│        │   ├── model_service.py        # Router: provider selection by model_name
+│        │   ├── model_service.py        # Router: selects provider by model_name
 │        │   ├── config/
 │        │   │   └── model_routing.yaml  # Routing rules and provider configs
 │        │   └── providers/              # LLM provider implementations
@@ -81,13 +81,16 @@ agent/
 │        │   ├── orchestrator.py         # Background loop: task selection and dispatch
 │        │   └── response_composer.py    # Final response generation via ModelService
 │        │
-│        ├── phs_service/         # Pseudohormonal system (PHS)
+│        ├── phs_service/         # Pseudohormonal System (PHS)
 │        │   ├── __init__.py
 │        │   ├── baseline_manager.py     # Baseline management: initialization, OU drift, shutdown effects
-│        │   ├── vector_encoder.py       # RFF encoding of hormonal profile to 128d vector
+│        │   ├── momentary_manager.py    # Momentary slice management: creation, decay, sedimentation
+│        │   ├── state_classifier.py     # State classification: cosine similarity with self_knowledge prototypes
+│        │   ├── vector_encoder.py       # RFF encoding of hormonal profile into 128d vector
 │        │   ├── valence_calculator.py   # Valence calculation with dynamic sensitivity formula
 │        │   ├── lifecycle_manager.py    # Agent lifecycle management (off/sleep/active), crash recovery
-│        │   └── phs_scheduler.py        # PHS background task scheduler (hourly drift)
+│        │   ├── phs_scheduler.py        # PHS background task scheduler (hourly drift, momentary decay)
+│        │   └── phs_cache.py            # Global cache of PHS manager instances (initialization optimization)
 │        │
 │        ├── session_services/    # Session management
 │        │   ├── __init__.py

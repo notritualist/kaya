@@ -1,17 +1,23 @@
 """
-phs_service/valence_calculator.py
-Модуль для расчёта валентности на основе текущих уровней гормонов.
-Формула:
+main-srv/src/phs_service/valence_calculator.py
+
+Valence Calculator
+
+Module for calculating valence based on current hormone levels.
+Formula:
     valence = tanh(sensitivity * (dopamine + oxytocin - cortisol)) * 100
 
-Коэффициент sensitivity берётся из state.settings (param_name='valence_sensitivity').
-Если параметр отсутствует — используется fallback 0.015.
+Sensitivity coefficient is read from state.settings (param_name='valence_sensitivity').
+If parameter is missing — fallback value 0.015 is used.
 
-Архитектурные требования:
-- Никаких зависимостей от BaselineManager / VectorEncoder.
-- Каждый вызов читает актуальное значение sensitivity из БД.
-- Без кэширования — чтобы изменения в settings сразу применялись.
+Architectural requirements:
+- No dependencies on BaselineManager or VectorEncoder.
+- Each call reads the actual sensitivity value from the database.
+- No caching — changes in settings take effect immediately.
 """
+
+version = "1.1.1"
+description = "Valence Calculator"
 
 import logging
 import math

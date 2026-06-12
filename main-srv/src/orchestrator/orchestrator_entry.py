@@ -1,27 +1,32 @@
 """
 main-srv/src/orchestrator/orchestrator_entry.py
 
-Orchestrator input interface.
+Orchestrator Input Interface
 
-Called from session_manager after saving the user's message.
-Creates a task to generate the final answer (user_answer_generation).
-Records user activity for global lifecycle state.
+Single entry point for creating orchestrator tasks.
+All modules (session_manager, phs_scheduler, lifecycle_manager) must use this interface instead of direct SQL INSERT.
 
-Architectural requirements:
-- Only one task type: user_answer_generation
-- All data from existing Postgres tables
-- Lifecycle activity recorded with actor_id from message
-- Agent version passed globally
+Supported task types:
+    user_answer_generation: generates the final response to the user.
+    phs_baseline_drift: natural baseline drift (OU process + sedimentation).
+    phs_momentary_decay: momentary decay to baseline.
+
+Architecture:
+    Generic function create_orchestrator_task() with task_type validation.
+    Specialized wrappers: on_user_message / schedule_phs_baseline_drift / schedule_phs_momentary_decay.
+    Lifecycle activity recorded with actor_id from the message.
+    Agent version passed globally via version.py.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
 import psycopg2
+from typing import Optional, Dict, Any
 from psycopg2.extras import RealDictCursor, Json
 from phs_service.lifecycle_manager import LifecycleManager
-from phs_service.lifecycle_manager import LifecycleManager
+
 
 # Глобальная версия проекта (из pyproject.toml через version.py)
 from version import __version__ as agent_version
@@ -137,3 +142,124 @@ def on_user_message(message_id: str) -> str:
     finally:
         if conn:
             conn.close()
+
+
+def create_orchestrator_task(
+    task_type_name: str,
+    input_data: Dict[str, Any],
+    priority: float = 0.5
+) -> str:
+    """
+    Универсальная функция создания задачи оркестратора.
+    
+    Единственная точка входа для создания задач. Все модули должны
+    использовать эту функцию вместо прямого INSERT.
+    
+    Логика:
+    1. Проверка существования типа задачи в orchestrator.task_types
+    2. Создание записи в orchestrator.orchestrator_tasks
+    3. Возврат UUID созданной задачи
+    
+    Args:
+        task_type_name: Имя типа задачи (user_answer_generation, phs_baseline_drift, etc.)
+        input_data: Данные для задачи (message_id, drift_type, etc.)
+        priority: Приоритет задачи (0.0-1.0, по умолчанию 0.5)
+        
+    Returns:
+        str: UUID созданной задачи
+        
+    Raises:
+        RuntimeError: если тип задачи не найден или ошибка БД
+    """
+    from db_manager.db_manager import load_postgres_config
+    db_config = load_postgres_config()
+    
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # 1. Проверяем существование типа задачи
+                cur.execute(
+                    "SELECT id FROM orchestrator.task_types WHERE type_name = %s",
+                    (task_type_name,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError(
+                        f"Task type '{task_type_name}' not found in orchestrator.task_types. "
+                        "Ensure migration was applied."
+                    )
+                task_type_id = row["id"]
+                
+                # 2. Создаём задачу
+                cur.execute("""
+                    INSERT INTO orchestrator.orchestrator_tasks (
+                        task_type_id, input_data, priority, status, agent_version, created_at
+                    ) VALUES (
+                        %s, %s, %s, 'pending', %s, NOW()
+                    )
+                    RETURNING id
+                """, (task_type_id, Json(input_data), priority, agent_version))
+                
+                task_id = str(cur.fetchone()["id"])
+                conn.commit()
+                
+                logger.info(
+                    f"Orchestrator task created: type={task_type_name}, "
+                    f"task_id={task_id[:8]}, priority={priority}"
+                )
+                return task_id
+                
+    except psycopg2.Error as e:
+        logger.error(f"Database error creating orchestrator task: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to create orchestrator task: {e}") from e
+    
+def schedule_phs_baseline_drift(
+    drift_type: str,
+    baseline_id: Optional[str] = None,
+    priority: float = 0.3
+) -> str:
+    """
+    Создаёт задачу дрейфа baseline.
+    
+    Обёртка над create_orchestrator_task для phs_baseline_drift.
+    
+    Args:
+        drift_type: Тип дрейфа ('hourly', 'offline')
+        baseline_id: ID активного baseline (опционально)
+        priority: Приоритет задачи
+        
+    Returns:
+        str: UUID созданной задачи
+    """
+    input_data = {"drift_type": drift_type}
+    if baseline_id:
+        input_data["baseline_id"] = baseline_id
+    
+    return create_orchestrator_task(
+        task_type_name="phs_baseline_drift",
+        input_data=input_data,
+        priority=priority
+    )
+
+
+def schedule_phs_momentary_decay(
+    decay_type: str = "natural",
+    priority: float = 0.4
+) -> str:
+    """
+    Создаёт задачу затухания momentary.
+    
+    Обёртка над create_orchestrator_task для phs_momentary_decay.
+    
+    Args:
+        decay_type: Тип затухания ('natural')
+        priority: Приоритет задачи
+        
+    Returns:
+        str: UUID созданной задачи
+    """
+    return create_orchestrator_task(
+        task_type_name="phs_momentary_decay",
+        input_data={"decay_type": decay_type},
+        priority=priority
+    )

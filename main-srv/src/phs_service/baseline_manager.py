@@ -1,13 +1,20 @@
 """
-phs_service/baseline_manager.py
-Менеджер долговременного гормонального фона (baseline).
+main-srv/src/phs_service/baseline_manager.py
 
-Функции:
-- Инициализация baseline при холодном старте.
-- Чтение и обновление активной записи.
-- Применение естественного дрейфа (OU-процесс с возвратом к уставке).
-- Защита от выхода за физиологические границы.
+Long-term Hormonal Background (Baseline) Manager.
+
+Functions:
+    - Initialize baseline on cold start.
+    - Read and update the active record.
+    - Apply natural drift (Ornstein-Uhlenbeck process with return to setpoint).
+    - Protect against exceeding physiological boundaries.
+    - Create new baseline record with automatic state classification.
+        (Computes state_id via classifier and links to prototype.
+         Deactivates previous active record.)
 """
+
+version = "1.2.0"
+description = "Long-term Hormonal Background (Baseline) Manager"
 
 import logging
 import random
@@ -18,19 +25,36 @@ from psycopg2.extras import RealDictCursor
 # Локальные импорты
 from phs_service.vector_encoder import HormonalVectorEncoder
 from phs_service.valence_calculator import compute_valence
+from phs_service.state_classifier import StateClassifier
 from version import __version__ as agent_version
 
 logger = logging.getLogger(__name__)
 
 
 class BaselineManager:
+    """
+    Менеджер долговременного гормонального фона.
+    
+    Отвечает за инициализацию, дрейф и осаждение baseline.
+    Все изменения создают новые записи, возвращают IDs до/после.
+    """
+   
     def __init__(self, db_config: Dict[str, Any]):
+        """
+        Инициализация менеджера baseline.
+        
+        Args:
+            db_config: Параметры подключения к PostgreSQL.
+        """
         self.db_config = db_config
+        self.agent_version = agent_version
         self.encoder = HormonalVectorEncoder(db_config)
+        self.classifier = StateClassifier(db_config) 
         self.setpoints: Dict[str, float] = {}
         self.mins: Dict[str, float] = {}
         self.alpha = 0.0
         self.noise = 0.0
+        self.ou_speed = 0.0
         self._load_settings()
         logger.debug("BaselineManager initialized.")
 
@@ -38,7 +62,6 @@ class BaselineManager:
         required_params = [
             "cortisol_setpoint", "dopamine_setpoint", "oxytocin_setpoint",
             "min_cortisol", "min_dopamine", "min_oxytocin",
-            "alpha_hourly_drift", # остаётся для будущего осаждения
             "baseline_drift_noise",
             "baseline_ou_speed",
         ]
@@ -66,11 +89,33 @@ class BaselineManager:
             "min_dopamine": float(settings["min_dopamine"]),
             "min_oxytocin": float(settings["min_oxytocin"]),
         }
-        self.alpha = float(settings["alpha_hourly_drift"])
         self.noise = float(settings["baseline_drift_noise"])
         self.ou_speed = float(settings["baseline_ou_speed"])
 
+    def _get_setting_float(self, param_name: str, default: float = 0.0) -> float:
+        """
+        Получает числовое значение параметра из state.settings.
+        
+        Args:
+            param_name: Имя параметра.
+            default: Значение по умолчанию.
+            
+        Returns:
+            float: Значение параметра или default.
+        """
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value_float FROM state.settings WHERE param_name = %s",
+                    (param_name,)
+                )
+                row = cur.fetchone()
+                if not row or row[0] is None:
+                    return default
+                return float(row[0])
+    
     def ensure_baseline_initialized(self) -> bool:
+        """Инициализирует baseline при холодном старте."""
         current = self.get_current_baseline()
         if current:
             return False
@@ -90,71 +135,129 @@ class BaselineManager:
         return True
 
     def get_current_baseline(self) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает активную запись baseline со всеми полями.
+        
+        Returns:
+            dict | None: Словарь с полями baseline или None.
+        """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT id, cortisol, dopamine, oxytocin, valence
+                    SELECT id, cortisol, dopamine, oxytocin, valence, state_vector
                     FROM state.baseline_phs WHERE is_active = TRUE LIMIT 1
                 """)
                 return cur.fetchone()
 
     def handle_drift_task(self, task_id: str, input_data: dict):
+        """
+        Обрабатывает задачу дрейфа baseline.
+        
+        Для drift_type='hourly' выполняет:
+        1. Естественный дрейф (OU-процесс).
+        2. Осаждение momentary в baseline (если alpha_hourly_drift > 0).
+        
+        Возвращает в output_data:
+        - baseline_id_before: ID baseline до дрейфа.
+        - baseline_id_after: ID baseline после осаждения.
+        """
         from services.service_metrics import (
             create_orchestrator_step, complete_step_success,
             complete_task_success, complete_task_error
         )
 
+        step_id = create_orchestrator_step(task_id, 1, "phs_baseline_drift", input_data)
+        
         try:
             drift_type = input_data.get("drift_type")
             
-            # Шаг создаётся строго внутри. Никаких внешних step_id.
-            # step_id передаётся извне для связывания с baseline
-            step_id = create_orchestrator_step(task_id, 1, "phs_baseline_drift", input_data)
-
             if drift_type == "hourly":
-                result = self.apply_natural_drift(step_id=step_id)
-                output = {"baseline_id": result.get("baseline_id"), "drift_type": "hourly"}
+                # 1. Естественный дрейф
+                drift_result = self.apply_natural_drift(step_id=step_id)
+                baseline_before = drift_result.get("baseline_id_before")
+                baseline_after_drift = drift_result.get("baseline_id_after")
+                
+                # 2. Осаждение momentary в baseline
+                # Получаем actor_id из активного momentary
+                actor_id = None
+                with psycopg2.connect(**self.db_config) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT actor_id FROM state.momentary WHERE is_active = TRUE LIMIT 1")
+                        row = cur.fetchone()
+                        if row:
+                            actor_id = str(row[0])
+                
+                sediment_result = None
+                baseline_after_sediment = baseline_after_drift
+                if actor_id:
+                    sediment_result = self.apply_hourly_sedimentation(actor_id=actor_id, step_id=step_id)
+                    if sediment_result and sediment_result.get("applied"):
+                        baseline_after_sediment = sediment_result.get("baseline_id_after")
+                
+                # ← ИСПРАВЛЕНО: полная трассировка
+                output = {
+                    "drift_type": "hourly",
+                    "baseline_id_before": baseline_before,
+                    "baseline_id_after": baseline_after_sediment,
+                    "drift_applied": drift_result.get("applied", False),
+                    "sedimentation_applied": sediment_result.get("applied", False) if sediment_result else False,
+                    "momentary_id": sediment_result.get("momentary_id") if sediment_result else None,
+                }
                 
             elif drift_type == "offline":
                 shutdown_type = input_data.get("shutdown_type")
                 downtime_sec = input_data.get("downtime_sec", 0)
                 result = self.apply_offline_drift(shutdown_type, downtime_sec, step_id=step_id)
+                
+                # ← ИСПРАВЛЕНО: полная трассировка
                 output = {
-                "baseline_id": result.get("baseline_id"),
-                "drift_type": "offline",
-                "shutdown_type": shutdown_type,
-                "downtime_hours": round(downtime_sec / 3600, 2)
+                    "drift_type": "offline",
+                    "baseline_id_before": result.get("baseline_id_before"),
+                    "baseline_id_after": result.get("baseline_id_after"),
+                    "shutdown_type": shutdown_type,
+                    "downtime_hours": round(downtime_sec / 3600, 2)
                 }
             else:
                 raise ValueError(f"Unknown drift_type: {drift_type}")
-
+            
             complete_step_success(step_id, output)
             complete_task_success(task_id, output)
-            logger.info(f"PHS drift task completed: baseline_id={output.get('baseline_id')}")
-
+            logger.info("PHS drift task completed: %s", output)
+            
         except Exception as e:
             logger.exception("PHS drift task failed")
             complete_task_error(task_id, "phs_service", str(e))
+            raise
 
     def apply_natural_drift(self, step_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Применяет естественный дрейф baseline (OU-процесс).
+        
+        Возвращает ID записи до и после изменения для трассировки.
+        
+        Args:
+            step_id: UUID шага оркестратора.
+            
+        Returns:
+            dict: Результат с baseline_id_before и baseline_id_after.
+        """
         current = self.get_current_baseline()
         if not current:
             return {"applied": False, "error": "no_baseline"}
-
+        
         before_id = str(current["id"])
-        cort, dopa, oxy = current["cortisol"], current["dopamine"], current["oxytocin"]
-
+        
+        # Вычисление новых значений
         new_hormones = {}
         for h in ["cortisol", "dopamine", "oxytocin"]:
             h_old = current[h]
             setpoint = self.setpoints[h]
-            min_key = f"min_{h}"
-            min_val = self.mins[min_key]
+            min_val = self.mins[f"min_{h}"]
             drift = self.ou_speed * (setpoint - h_old)
             noise_term = self.noise * random.gauss(0, 1)
             h_new = max(min_val, min(100.0, h_old + drift + noise_term))
             new_hormones[h] = h_new
-
+        
         valence = compute_valence(**new_hormones)
         vector = self.encoder.encode(**new_hormones, valence=valence)
         
@@ -163,7 +266,11 @@ class BaselineManager:
             valence, vector, "hourly_drift", step_id=step_id
         )
         
-        return {"applied": True, "baseline_id": after_id}
+        return {
+            "applied": True,
+            "baseline_id_before": before_id,
+            "baseline_id_after": after_id
+        }
 
     def _map_shutdown_to_reason(self, shutdown_type: str) -> str:
         mapping: Dict[str, str] = {
@@ -178,6 +285,25 @@ class BaselineManager:
             raise RuntimeError(f"Unknown shutdown_type: '{shutdown_type}'. Cannot map to reason_code.")
         return reason_code
 
+    def apply_hourly_sedimentation(self, actor_id: str, step_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+       Применяет ежечасное осаждение momentary в baseline.
+        
+        Коэффициент alpha вычисляется динамически внутри sediment_momentary_to_baseline
+        как 1.0 / N_активных_сессий.
+        """
+        from phs_service.momentary_manager import MomentaryManager
+                       
+        momentary_mgr = MomentaryManager(self.db_config)
+        result = momentary_mgr.sediment_momentary_to_baseline(
+            actor_id=actor_id, reason_code="hourly_sedimentation"
+        )
+        
+        if result:
+            result["applied"] = True
+            return result
+        return {"applied": False, "reason": "no active momentary"}
+        
     def apply_offline_drift(self, shutdown_type: Optional[str], downtime_sec: float, step_id: Optional[str] = None) -> Dict[str, Any]:
         logger.info(f"=== OFFLINE DRIFT CALLED: type={shutdown_type}, downtime_sec={downtime_sec:.2f} (hours={downtime_sec/3600:.2f}) ===")
         if shutdown_type is None:
@@ -238,25 +364,79 @@ class BaselineManager:
         
         after_id = self._insert_baseline(cort, dopa, oxy, valence, vector, reason_code, step_id=step_id)
         
-        return {"applied": True, "baseline_id": after_id}
+        return {
+        "applied": True,
+        "baseline_id_before": before_id,
+        "baseline_id_after": after_id
+        }
 
-    def _insert_baseline(self, cortisol, dopamine, oxytocin, valence, vector, reason_code: str, step_id: Optional[str] = None) -> str:
+    def _insert_baseline(
+        self,
+        cortisol: float,
+        dopamine: float,
+        oxytocin: float,
+        valence: float,
+        vector: list,
+        reason_code: str,
+        step_id: Optional[str] = None
+    ) -> str:
+        """
+        Вставляет новую запись baseline с автоматической классификацией состояния.
+        
+        Вычисляет state_id через классификатор и сохраняет связь с прототипом.
+        Деактивирует предыдущую активную запись.
+        
+        Args:
+            cortisol, dopamine, oxytocin: Уровни гормонов [0..100].
+            valence: Валентность [-100..100].
+            vector: Вектор состояния (128 float).
+            reason_code: Код причины изменения baseline.
+            step_id: UUID шага оркестратора (опционально).
+            
+        Returns:
+            str: UUID новой записи baseline.
+        """
+        # Классифицируем состояние
+        state_match = self.classifier.classify_vector(vector)
+        state_id = state_match.state_id
+        
+        logger.debug(
+            f"Baseline classified: state={state_match.state_code}, "
+            f"confidence={state_match.confidence:.2f}"
+        )
+        
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM state.baseline_change_reasons WHERE reason_code = %s", (reason_code,))
+                # Получаем reason_id
+                cur.execute(
+                    "SELECT id FROM state.baseline_change_reasons WHERE reason_code = %s",
+                    (reason_code,)
+                )
                 row = cur.fetchone()
                 if not row:
-                    raise RuntimeError(f"Reason code '{reason_code}' not found in state.baseline_change_reasons.")
+                    raise RuntimeError(f"Reason code '{reason_code}' not found.")
                 reason_id = row[0]
-
-                cur.execute("UPDATE state.baseline_phs SET is_active = FALSE WHERE is_active = TRUE")
-                cur.execute("""
+                
+                # Деактивируем текущий baseline
+                cur.execute(
+                    "UPDATE state.baseline_phs SET is_active = FALSE WHERE is_active = TRUE"
+                )
+                
+                # Вставляем новый с state_id
+                cur.execute(
+                    """
                     INSERT INTO state.baseline_phs (
-                        cortisol, dopamine, oxytocin, valence,
-                        state_vector, change_reason_id, is_active, agent_version, orchestrator_step_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                        cortisol, dopamine, oxytocin, valence, state_vector,
+                        change_reason_id, state_id, is_active, agent_version, orchestrator_step_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
                     RETURNING id
-                """, (cortisol, dopamine, oxytocin, valence, vector, reason_id, agent_version, step_id))
-                new_id = cur.fetchone()[0]
+                    """,
+                    (
+                        cortisol, dopamine, oxytocin, valence, vector,
+                        reason_id, state_id, agent_version, step_id
+                    )
+                )
+                new_id = str(cur.fetchone()[0])
                 conn.commit()
-                return str(new_id)
+        
+        return new_id

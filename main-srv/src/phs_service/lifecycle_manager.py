@@ -1,23 +1,40 @@
 """
 main-srv/src/phs_service/lifecycle_manager.py
 
-Global Agent Lifecycle Management within the PHS Framework.
+Global Agent Lifecycle Manager within the PHS Framework.
 
 Principles:
-    The agent state (off/sleep/active) is UNIFIED across the entire system.
-    The actor_id field records the INITIATOR of a change but does not create separate states.
-    The orchestrator is the source of truth for timeout‑driven transitions.
-    The PHS logic (baseline drift during shutdown/crash) is fully preserved.
-    Handle_startup guarantees closing ANY stuck record (active/sleep/off).
+    - Agent state (off/sleep/active) is UNIFIED across the entire system.
+    - The actor_id field records the INITIATOR of a change but does not create separate states.
+    - The orchestrator is the source of truth for timeout-driven transitions.
+    - PHS logic (baseline drift during shutdown/crash) is fully preserved.
+    - handle_startup guarantees closing ANY dangling record (active/sleep/off).
+
+Responsibilities:
+    - Start and stop lifecycle states
+    - Handle graceful startup and crash recovery
+    - Record shutdown reasons (shutdown_reasons)
+    - Apply offline drift to baseline during downtime
+    - Sediment dangling momentary states on crash
+    - Wake up from sleep
+
+Dependencies:
+    - BaselineManager (drift, sedimentation)
+    - MomentaryManager (sediment dangling states)
+    - state.agent_lifecycle, state.shutdown_reasons
+
+DB schema: migration V003
+Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.1.0"
+version = "1.2.0"
 description = "Global agent lifecycle manager"
 
 import logging
 from datetime import datetime, timezone
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
-from typing import Dict, Any, Optional
+from psycopg2.extras import RealDictCursor
+from typing import Optional
+from phs_service.momentary_manager import MomentaryManager
 # Import global agent version from pyproject.toml
 from version import __version__ as agent_version
 
@@ -147,15 +164,28 @@ class LifecycleManager:
         logger.debug(f"Converted lifecycle record {record_id[:8]} to off (crash_recovery)")
 
     def _get_inactivity_sleep_minutes(self) -> float:
+     return self._get_setting_float("inactivity_sleep_minutes", default=5.0)
+            
+    def _get_setting_float(self, param_name: str, default: float = 0.2) -> float:
+        """
+        Получает числовое значение параметра из state.settings.
+        
+        Args:
+            param_name: имя параметра (например 'alpha_session_end')
+            default: значение по умолчанию, если параметр не найден
+            
+        Returns:
+            float: значение параметра или default
+        """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT value_float FROM state.settings 
-                    WHERE param_name = 'inactivity_sleep_minutes'
-                """)
+                    WHERE param_name = %s
+                """, (param_name,))
                 row = cur.fetchone()
                 if not row or row[0] is None:
-                    return 5.0
+                    return default
                 return float(row[0])
 
     # =========================================================================
@@ -251,12 +281,13 @@ class LifecycleManager:
     def handle_startup(self, actor_id: str) -> None:
         """
         Вызывается при запуске. Корректно различает штатный старт и креш.
-        
+    
         Логика:
         1. Если есть запись с ended_at=NULL:
-           - state_type='off' → штатный старт. Закрываем off, применяем дрейф, стартуем active.
-           - state_type='active'/'sleep' → креш. Запрашиваем причину, применяем дрейф,
-             КОНВЕРТИРУЕМ запись в off (без дублирования), стартуем active.
+        - state_type='off' → штатный старт. Закрываем off, применяем дрейф, стартуем active.
+        - state_type='active'/'sleep' → креш. Запрашиваем причину, применяем дрейф,
+            КОНВЕРТИРУЕМ запись в off (без дублирования), осаждаем зависшие momentary,
+            стартуем active.
         2. Если нет активной записи → стартуем active.
         """
         logger.info("Starting pseudohormonal lifecycle recovery...")
@@ -298,23 +329,51 @@ class LifecycleManager:
             return
 
         # === active или sleep с ended_at=NULL — это креш ===
-        logger.warning(
-            f"Detected dangling lifecycle state: {state_type} (id={current['id'][:8]}). "
-            f"Treating as crash/kill."
-        )
-
-        shutdown_type = self._prompt_shutdown_reason()
-        shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-
-        baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
-
-        # ИСПРАВЛЕНИЕ: Конвертируем запись в off вместо дублирования
-        self._convert_to_off(current['id'], shutdown_id, now)
-
-        self._start_new_lifecycle(actor_id, 'startup', 'active')
+        if state_type in ('active', 'sleep'):
+            logger.warning(f"Detected dangling lifecycle state: {state_type}. Treating as crash.")
+        
+            shutdown_type = self._prompt_shutdown_reason()
+            shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
+            
+            # Применяем offline drift
+            baseline_mgr.apply_offline_drift(shutdown_type, downtime_duration, step_id=None)
+            
+            # === CRASH RECOVERY: Осаждение всех зависших momentary ===
+            momentary_mgr = MomentaryManager(self.db_config)
+            momentary_mgr.sediment_all_active_momentaries(reason_code="crash_sedimentation")
+            
+            # Сбрасываем флаги momentary
+            momentary_mgr.close_dangling_momentary()
+            
+            # Конвертируем запись в off
+            self._convert_to_off(current['id'], shutdown_id, now)
+            self._start_new_lifecycle(actor_id, 'startup', 'active')
+            return
 
     def handle_graceful_shutdown(self, actor_id: str, exit_reason: str) -> None:
+        """
+        Обрабатывает штатное выключение агента.
+    
+        Выполняет:
+        1. Осаждение momentary в baseline с коэффициентом alpha_session_end.
+        2. Деактивацию momentary (is_active = false).
+        3. Закрытие lifecycle и переход в off.
+    
+        Args:
+            actor_id: UUID актора, инициировавшего выключение.
+            exit_reason: Причина выхода (user_exit, user_command).
+        """
         logger.info(f"Handling graceful shutdown (reason: {exit_reason})...")
+
+        from phs_service.momentary_manager import MomentaryManager
+        momentary_mgr = MomentaryManager(self.db_config)
+
+        # === 1. Осаждение momentary в baseline ===
+        momentary_mgr.sediment_momentary_to_baseline(actor_id=actor_id, reason_code="session_end_sedimentation")
+
+        # === 2. Деактивация momentary ===
+        # Сбрасываем is_active, чтобы при следующем запуске не было warning о dangling
+        momentary_mgr.deactivate_for_actor(actor_id)
 
         shutdown_type = self._prompt_shutdown_reason()
         shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)

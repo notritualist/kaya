@@ -5,20 +5,25 @@ Session and dialog manager for agent interfaces.
 
 Responsible for:
 - Binding users (console:) to actors (owner/user)
-- Creating a physical connection session (dialogs.sessions)
+- Creating a physical connection session (dialogs.sessions) with PHS integration
 - Managing the dialog lifecycle via dialog_services.dialogue_manager:
-* Lazy dialog creation on first message
-* Automatic inactivity timeout check
-* Manual dialog termination (Ctrl+N / rotate_dialogue)
+    * Lazy dialog creation on first message
+    * Automatic inactivity timeout check
+    * Manual dialog termination (Ctrl+N / rotate_dialogue)
 - Saving messages in dialogs.row_messages with a binding to dialog_id
 - Correctly ending dialogs and sessions on exit
 - Cleaning up frozen sessions and dialogs when restarting the agent
 
-DB schema: migration V002, migration V002
-Tables: users.actors, users.actors_external_ids, dialogs.sessions, dialogs.dialogues, dialogs.row_messages
+PHS Integration:
+- Each new session automatically creates a momentary state snapshot
+- Snapshot links to current baseline and actor context
+
+DB schema: migration V002, V003
+Tables: users.actors, users.actors_external_ids, dialogs.sessions, 
+        dialogs.dialogues, dialogs.row_messages, state.momentary
 """
 
-version = "1.1.0"
+version = "1.2.0"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -27,6 +32,8 @@ from psycopg2.extras import RealDictCursor
 from typing import Optional
 from datetime import datetime, timezone
 from dialog_services.dialogue_manager import ensure_active_dialogue, close_active_dialogue
+from phs_service.momentary_manager import MomentaryManager
+from phs_service.phs_cache import get_momentary_manager
 
 # Логгер модуля — подхватит настройки из main.py
 logger = logging.getLogger(__name__)
@@ -284,79 +291,139 @@ class SessionManager:
     
     def create_session(self) -> str:
         """
-        Создаёт новую физическую сессию диалога (dialogs.sessions).
-        Логический диалог создаётся лениво в save_message().
+        Создаёт новую физическую сессию и моментальный гормональный срез в одной транзакции.
+        
+        Логика:
+        1. BEGIN
+        2. Читаем актуальный baseline (гормоны, вектор, id).
+        3. Вставляем dialogs.sessions.
+        4. Вставляем state.momentary с session_id, baseline_id, state_id.
+        5. Обновляем dialogs.sessions с baseline_id, state_id.
+        6. COMMIT
+        
+        Гарантирует атомарность и согласованность состояния.
+        Исключает создание momentary из устаревшего baseline.
         
         Returns:
-            str: UUID новой сессии
+            str: UUID новой сессии.
+            
         Raises:
-            RuntimeError: если сессия уже активна или actor_id не задан
-        
-        Важно: каждый запуск консоли = новая сессия (не resume).
+            RuntimeError: если сессия уже активна, actor_id не задан, или baseline не найден.
         """
         if self.session_id:
             logger.warning(f"Session already active: {self.session_id[:8]}")
-            raise RuntimeError("Session already active: ")
+            raise RuntimeError("Session already active")
         if not self.actor_id:
             logger.error("Actor_id not set. Call ensure_actor_linked() first")
-            raise RuntimeError("Actor_id not set. Call ensure_actor_linked() first")
+            raise RuntimeError("Actor_id not set")
         
-        logger.info(f"Creating new session")
+        logger.info("Creating new session with momentary slice...")
         
+        # Вычисляем sleep_duration
+        last_closed = self._query("""
+            SELECT closed_at FROM dialogs.sessions
+            WHERE actor_id = %s AND status = 'completed'
+            ORDER BY closed_at DESC LIMIT 1
+        """, params=(self.actor_id,), fetch=True)
+        
+        sleep_duration_expr = "NULL"
+        sleep_params = []
+        if last_closed and last_closed['closed_at']:
+            sleep_duration_expr = "NOW() - %s::timestamptz"
+            sleep_params = [last_closed['closed_at']]
+        
+        conn = self._get_conn()
         try:
-            # === ВЫЧИСЛЯЕМ SLEEP_DURATION ===
-            last_closed = self._query("""
-                SELECT closed_at
-                FROM dialogs.sessions
-                WHERE actor_id = %s AND status = 'completed'
-                ORDER BY closed_at DESC
-                LIMIT 1
-            """, params=(self.actor_id,), fetch=True)
-            
-            sleep_duration_expr = "NULL"
-            sleep_params = []
-            if last_closed and last_closed['closed_at']:
-                sleep_duration_expr = "NOW() - %s::timestamptz"
-                sleep_params = [last_closed['closed_at']]
-            
-            # === Создаём сессию ===
-            row = self._query(f"""
-                INSERT INTO dialogs.sessions 
-                (
-                    actor_id, 
-                    actor_external_id, 
-                    status, 
-                    agent_version,
-                    sleep_duration
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # === BEGIN ===
+                # cursor context manager doesn't auto-commit, we control it
+                
+                # 1. Читаем актуальный baseline
+                cur.execute("""
+                    SELECT id, cortisol, dopamine, oxytocin, valence, state_vector
+                    FROM state.baseline_phs WHERE is_active = TRUE LIMIT 1
+                """)
+                baseline = cur.fetchone()
+                if not baseline:
+                    raise RuntimeError("Cannot create session: no active baseline found. Ensure baseline is initialized.")
+                
+                baseline_id = str(baseline['id'])
+                cort = baseline['cortisol']
+                dopa = baseline['dopamine']
+                oxy = baseline['oxytocin']
+                valence = baseline['valence']
+                vector = baseline['state_vector']
+                
+                # 2. Классифицируем состояние для state_id
+                # Импортируем здесь, чтобы избежать циклических импортов
+                from phs_service.state_classifier import StateClassifier
+                classifier = StateClassifier(self.db_config)
+                state_match = classifier.classify_vector(vector)
+                state_id = state_match.state_id
+                
+                # 3. Вставляем сессию
+                cur.execute(f"""
+                    INSERT INTO dialogs.sessions (
+                        actor_id, actor_external_id, status, agent_version, sleep_duration
+                    ) VALUES (
+                        %s, %s, 'active', %s, {sleep_duration_expr}
+                    ) RETURNING id
+                """, (self.actor_id, self.actor_external_id, self.agent_version, *sleep_params))
+                session_row = cur.fetchone()
+                if not session_row:
+                    raise RuntimeError("Failed to create session in DB")
+                session_id = str(session_row['id'])
+                
+                # 4. Деактивируем предыдущий momentary для актора
+                cur.execute("""
+                    UPDATE state.momentary SET is_active = FALSE
+                    WHERE actor_id = %s AND is_active = TRUE
+                """, (self.actor_id,))
+                
+                # 5. Получаем event_type_id для agent_start
+                cur.execute("""
+                    SELECT id FROM state.delta_reasons WHERE event_type_code = %s
+                """, ("agent_start",))
+                event_row = cur.fetchone()
+                event_type_id = event_row['id'] if event_row else None
+                
+                # 6. Вставляем momentary
+                cur.execute("""
+                    INSERT INTO state.momentary (
+                        session_id, baseline_id, actor_id,
+                        cortisol, dopamine, oxytocin, valence, state_vector,
+                        state_id, event_type_id, is_active, agent_version
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s
+                    ) RETURNING id
+                """, (
+                    session_id, baseline_id, self.actor_id,
+                    cort, dopa, oxy, valence, vector,
+                    state_id, event_type_id, self.agent_version
+                ))
+                momentary_row = cur.fetchone()
+                momentary_id = str(momentary_row['id']) if momentary_row else None
+                
+                # 7. Обновляем сессию с baseline_id и state_id
+                cur.execute("""
+                    UPDATE dialogs.sessions
+                    SET baseline_id = %s, state_id = %s
+                    WHERE id = %s
+                """, (baseline_id, state_id, session_id))
+                
+                # === COMMIT ===
+                conn.commit()
+                
+                self.session_id = session_id
+                logger.info(
+                    f"Session created: {session_id[:8]}, momentary: {(momentary_id or 'N/A')[:8]}, "
+                    f"baseline: {baseline_id[:8]}, state: {state_match.state_code}"
                 )
-                VALUES (
-                    %s, 
-                    %s, 
-                    'active', 
-                    %s,
-                    {sleep_duration_expr}
-                )
-                RETURNING id
-            """, params=(
-                self.actor_id,
-                self.actor_external_id,
-                self.agent_version,
-                *sleep_params
-            ), fetch=True)
-            
-            if not row:
-                logger.error("Failed to create session in DB (no RETURNING id)")
-                raise RuntimeError("Failed to create session in DB (no RETURNING id)")
-            
-            self.session_id = str(row['id'])
-            logger.info(f"Session created: {self.session_id[:8]}")
-            return self.session_id
-            
-        except ValueError as e:
-            logger.error(f"Validation error: {e}")
-            raise
+                return session_id
+                
         except Exception as e:
-            logger.error(f"Error creating session: {e}", exc_info=True)
+            conn.rollback()
+            logger.error(f"Error creating session with momentary: {e}", exc_info=True)
             raise
     
     def rotate_dialogue(self, reason: str = 'user_new_dialogue'):
@@ -380,18 +447,22 @@ class SessionManager:
         """
         Сохраняет сообщение пользователя в dialogs.row_messages.
         Автоматически обеспечивает наличие активного диалога (V002).
-                  
+        
         Заполняет поля согласно миграциям БД:
         - actor_id, actor_type (из self.actor_type: 'owner' или 'user')
         - session_id
         - dialogue_id (автоматически через ensure_active_dialogue)
         - row_text (сырой текст)
         - agent_version, timestamp
-        
+               
         Args:
             content: текст сообщения
+            
         Returns:
             str: UUID сохранённого сообщения
+            
+        Raises:
+            RuntimeError: если сессия не создана или actor_id не задан
         """
         if not self.session_id:
             logger.error("Session not created. Call create_session() first")

@@ -154,24 +154,25 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
         else:
             logger.debug(f"User {console_user_id} already linked to {session_service.actor_type}")
         
-        # === ШАГ 4: Создание новой сессии ===
+        # === ШАГ 4: === PHS Lifecycle Initialization (Вызываем после того, как actor_id гарантированно определён) ===
+        # Гарантируем, что actor_id установлен (после ensure_actor_linked/create_session это всегда так)
+        assert session_service.actor_id is not None, "actor_id must be set after ensure_actor_linked"
+        lifecycle_mgr.handle_startup(session_service.actor_id)
+        logger.info("PHS lifecycle initialized, baseline ready.")
+
+        # === ШАГ 5: Создание новой сессии ===
         # Каждый запуск консоли = новая сессия (не возобновляем старые)
         session_id = session_service.create_session()
         logger.info(f"New dialog session created: {session_id}")
         _print_status(f"Session #{session_id[:8]} started", True)
         
-        # === ШАГ 5: Вывод приветствия (теперь все данные известны) ===
+        # === ШАГ 6: Вывод приветствия (теперь все данные известны) ===
         _print_welcome(agent_version, console_user_id, session_service.actor_type)
         
-        # === ШАГ 5.1: Создаём сессию ввода с привязкой менеджера (для Ctrl+N) ===
+        # === ШАГ 7: Создаём сессию ввода с привязкой менеджера (для Ctrl+N) ===
         prompt_session = create_prompt_session(session_service)
 
-        # === ШАГ 5.2 === PHS Lifecycle Initialization (Вызываем после того, как actor_id гарантированно определён) ===
-        # Гарантируем, что actor_id установлен (после ensure_actor_linked/create_session это всегда так)
-        assert session_service.actor_id is not None, "actor_id must be set after ensure_actor_linked"
-        lifecycle_mgr.handle_startup(session_service.actor_id)
-
-        # === ШАГ 6: Основной цикл диалога ===
+        # === ШАГ 8: Основной цикл диалога ===
         while True:
             try:
                 # Получаем многострочный ввод
@@ -188,11 +189,11 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                 
                 logger.debug(f"Received user message: {len(user_input)} chars")
                 
-                # 6.1: Сохраняем сообщение в БД
+                # 8.1: Сохраняем сообщение в БД
                 message_id = session_service.save_message(content=user_input)
                 logger.debug(f"Message saved to DB with ID: {message_id[:8]}")
                 
-                # 6.2: Создаём задачу для оркестратора
+                # 8.2: Создаём задачу для оркестратора
                 from orchestrator.orchestrator_entry import on_user_message
                 try:
                     orchestrator_task_id = on_user_message(message_id=message_id)
@@ -202,20 +203,20 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                     # Не прерываем цикл — просто ждём ответа (он не придёт, но интерфейс останется жив)
                     orchestrator_task_id = None
                                                  
-                # 6.3: Обновляем время активности сессии
+                # 8.3: Обновляем время активности сессии
                 session_service.update_activity()
 
-                # 6.4: Показываем статус обработки
+                # 8.4: Показываем статус обработки
                 status_text = "⚙️  Agent is thinking..."
                 print(f"\n{status_text}", end="", flush=True)
 
-                # 6.5: Ожидаем ответ от агента
+                # 8.5: Ожидаем ответ от агента
                 agent_response = session_service.wait_for_agent_response(
                     user_message_id=message_id,
                     timeout_seconds=300
                 )
 
-                # 6.6: Заменяем статус на ответ
+                # 8.6: Заменяем статус на ответ
                 if agent_response:
                     print(f"\r{' ' * len(status_text)}\r🤖 Agent: {agent_response}\n", end="", flush=True)
                     logger.info("Agent response received: {len(agent_response)} chars")
@@ -240,7 +241,7 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
         _print_status(f"Critical error: {e}", False)
         exit_reason = "critical_error"
     
-    # === ШАГ 7: Завершение сессии ===
+    # === ШАГ 9: Завершение сессии ===
     finally:
         logger.info(f"Closing dialog session with reason: {exit_reason}")
        

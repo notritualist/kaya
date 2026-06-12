@@ -4,14 +4,20 @@ main-srv/src/orchestrator/orchestrator.py
 Main loop of the AGI task orchestrator.
 
 Features:
-- Singleton background thread
-- Safe task retrieval via FOR UPDATE SKIP LOCKED
-- Concurrency control: one generation at a time
-- Fault tolerance: errors logged, loop continues
-- Lifecycle integration: check_inactivity on each pulse
+- Singleton background thread with safe task retrieval (FOR UPDATE SKIP LOCKED).
+- Concurrency control: one task at a time via _composer_busy flag.
+- Task handlers: user_answer_generation, phs_baseline_drift, phs_momentary_decay.
+- Fault tolerance: errors logged, loop continues.
+- Lifecycle integration: check_inactivity and dialogue timeouts on each pulse.
+
+Architecture:
+- Orchestrator runs as daemon thread started from main.py.
+- Tasks created by orchestrator_entry or phs_scheduler.
+- Handlers dispatched via mapping dict, executed in separate threads.
+- Metrics updated via service_metrics module.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
@@ -32,10 +38,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # НАСТРОЙКИ ОРКЕСТРАТОРА
 # =============================================================================
-
-# Пульс оркестратора — интервал между проверками очереди задач (в секундах).
-# Аналог человеческого пульса: не слишком часто, но достаточно для отзывчивости.
-PULSE_SECONDS: int = 1
 
 # Флаг работы основного цикла
 _running: bool = False
@@ -149,21 +151,33 @@ def _handle_answer_generation(task_id: str, input_data: dict) -> None:
         with _composer_lock:
             _composer_busy = False
 
-def _get_task_type_name(db_config: dict, task_id: str) -> str:
-    """Возвращает type_name задачи по её ID."""
-    with psycopg2.connect(**db_config) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT tt.type_name
-                FROM orchestrator.orchestrator_tasks t
-                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
-                WHERE t.id = %s
-            """, (task_id,))
-            row = cur.fetchone()
-            return row[0] if row else "unknown"
+def _handle_momentary_decay(task_id: str, input_data: dict) -> None:
+    """
+    Обработчик задачи затухания momentary к baseline.
+    
+    Вызывает MomentaryManager.handle_decay_task, завершает задачу, сбрасывает флаг.
+    """
+    global _composer_busy
+    try:
+        from phs_service.momentary_manager import MomentaryManager
+        from db_manager.db_manager import load_postgres_config
+        mgr = MomentaryManager(load_postgres_config())
+        mgr.handle_decay_task(task_id, input_data)
+    except Exception as e:
+        logger.exception("PHS momentary decay task failed")
+        from services.service_metrics import complete_task_error
+        complete_task_error(task_id, "phs_service", str(e))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
         
-#  Функция дрейфа PHS
 def _handle_phs_drift(task_id: str, input_data: dict):
+    """
+    Обработчик задачи естественного дрейфа baseline.
+    
+    Вызывает BaselineManager.handle_drift_task, завершает задачу, сбрасывает флаг.
+    """
     global _composer_busy
     try:
         from phs_service.baseline_manager import BaselineManager
@@ -177,23 +191,58 @@ def _handle_phs_drift(task_id: str, input_data: dict):
             _composer_busy = False
 
 
+def _get_task_type_name(db_config: dict, task_id: str) -> str:
+    """Возвращает type_name задачи по её ID."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tt.type_name
+                FROM orchestrator.orchestrator_tasks t
+                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                WHERE t.id = %s
+            """, (task_id,))
+            row = cur.fetchone()
+            return row[0] if row else "unknown"
+        
+
+def load_pulse_seconds(db_config: dict) -> int:
+    """Загружает orchestrator_pulse_seconds из state.settings."""
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT value_float 
+                    FROM state.settings 
+                    WHERE param_name = 'orchestrator_pulse_seconds'
+                """)
+                row = cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else 1
+    except Exception:
+        logger.warning("Failed to load orchestrator_pulse_seconds from DB, using default=1")
+        return 1
+    
+
 def _orchestrator_loop():
     """
-     Основной цикл оркестратора.
+    Основной цикл оркестратора.
     
     На каждом пульсе:
-    1. Проверяет таймаут бездействия (lifecycle check_inactivity)
-    2. Извлекает задачу из очереди
-    3. Проверяет таймауты диалогов и закрывает просроченные.
-    4. Запускает обработчик в отдельном потоке
+    1. Проверяет таймаут бездействия (lifecycle).
+    2. Проверяет таймауты диалогов.
+    3. Если не занят — извлекает задачу по приоритету:
+       - user_answer_generation
+       - phs_baseline_drift
+       - phs_momentary_decay
+    4. Запускает обработчик в отдельном потоке.
     """
     global _composer_busy, _running
 
     db_config = load_postgres_config()
+    pulse_seconds = load_pulse_seconds(db_config)
     # Инициализация lifecycle manager
     lifecycle_mgr = LifecycleManager(db_config)
 
-    logger.info("Orchestrator started. Pulse interval: %d second(s)", PULSE_SECONDS)
+    logger.info("Orchestrator started. Pulse interval: %d second(s)", pulse_seconds)
 
     while _running:
         try:
@@ -202,47 +251,56 @@ def _orchestrator_loop():
             check_dialogue_timeouts(db_config)
             
             if not _composer_busy:
+                # === ИЗВЛЕЧЕНИЕ ЗАДАЧИ ПО ПРИОРИТЕТУ ===
+                # 1. Ответ пользователю
                 task = _get_pending_task(db_config, "user_answer_generation")
+                
+                # 2. Дрейф baseline
                 if not task:
                     task = _get_pending_task(db_config, "phs_baseline_drift")
-
+                
+                # 3. Затухание momentary ← ДОБАВЛЕНО
+                if not task:
+                    task = _get_pending_task(db_config, "phs_momentary_decay")
+                
                 if task:
                     task_id = task["id"]
                     input_data = task["input_data"]
                     task_type = _get_task_type_name(db_config, task_id)
-
+                    
                     mark_task_running(task_id)
-
+                    
                     with _composer_lock:
                         _composer_busy = True
-
+                    
                     # Маппинг типов → обработчиков
                     handlers: Dict[str, Callable] = {
                         "user_answer_generation": _handle_answer_generation,
                         "phs_baseline_drift": _handle_phs_drift,
+                        "phs_momentary_decay": _handle_momentary_decay,
                     }
-
+                    
                     target = handlers.get(task_type)
                     if not target:
                         complete_task_error(task_id, "orchestrator", f"Unknown task type: {task_type}")
                         with _composer_lock:
                             _composer_busy = False
                         continue
-
+                    
                     threading.Thread(
                         target=target,
                         args=(task_id, input_data),
                         daemon=True,
                         name=f"Orch-{task_type[:10]}-{task_id[:8]}"
                     ).start()
-
-                    logger.debug(f"Launched task {task_type}: {task_id[:8]}")
-
-            time.sleep(PULSE_SECONDS)
+                    
+                    logger.debug("Launched task %s: %s", task_type, task_id[:8])
+            
+            time.sleep(pulse_seconds)
 
         except Exception as exc:
             logger.exception("Critical error in orchestrator loop: %s", exc)
-            time.sleep(PULSE_SECONDS)
+            time.sleep(pulse_seconds)
 
 
 def start_orchestrator() -> threading.Thread | None:

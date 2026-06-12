@@ -1,20 +1,33 @@
 """
-phs_service/vector_encoder.py
-Модуль векторизации гормонального профиля через Random Fourier Features (RFF).
+main-srv/src/phs_service/vector_encoder.py
 
-Реализация:
-- Нормализация входов: cort/100, dopa/100, oxy/100, (val+100)/200.
-- Проекция: proj = (B / sigma) @ x, где B ~ N(0,1), sigma = 1/sqrt(2*gamma).
-- Преобразование: interleaved sin/cos -> вектор 128.
-- L2-нормализация результата.
-- Параметры (omega, gamma, seed) хранятся в state.settings.
-- Матрица omega генерируется один раз по seed и фиксируется в БД.
+Vector Encoder
+
+Module for hormonal profile vectorization using Random Fourier Features (RFF).
+
+Implementation:
+- Input normalization: cort/100, dopa/100, oxy/100, (val+100)/200.
+- Projection: proj = (B / sigma) @ x, where B ~ N(0,1), sigma = 1/sqrt(2*gamma).
+- Transformation: interleaved sin/cos -> 128-dim vector.
+- L2 normalization of the result.
+- Parameters (omega, gamma, seed) stored in state.settings.
+- Omega matrix generated once by seed and fixed in the database.
+- Uses a class-level cache for omega and sigma to avoid repeated database reads when creating multiple instances.
+
+Architecture:
+- Stateless encoder: reads parameters from DB or uses defaults.
+- Omega matrix cached in DB settings (value_json) to ensure reproducibility.
+- Input dimension: 4 (cortisol, dopamine, oxytocin, valence).
+- Output dimension: 128 (halfvec type for pgvector).
 """
+
+version = "1.2.0"
+description = "RFF Vector Encoder"
 
 import logging
 import math
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, ClassVar
 import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -56,11 +69,17 @@ class HormonalVectorEncoder:
         is_initialized (bool): Флаг успешной загрузки параметров.
     """
 
+    # Class-level кэш для общих параметров (избегаем повторных чтений БД)
+    _shared_omega: ClassVar[Optional[np.ndarray]] = None
+    _shared_sigma: ClassVar[Optional[float]] = None
+    _cache_initialized: ClassVar[bool] = False
+
     def __init__(self, db_config: Dict[str, Any]):
         """
-        Инициализирует энкодер, загружая параметры из БД.
+        Инициализирует энкодер, загружая параметры из БД или кэша.
 
         Если параметры отсутствуют, генерирует их детерминировано и сохраняет.
+        Использует class-level кэш для избежания повторных чтений БД.
 
         Args:
             db_config: Параметры подключения к PostgreSQL.
@@ -74,9 +93,24 @@ class HormonalVectorEncoder:
 
     def _load_or_init_params(self) -> None:
         """
-        Загружает omega и sigma из state.settings.
-        Если omega отсутствует, генерирует по seed и сохраняет.
+        Загружает omega и sigma из class-level кэша или БД.
+        
+        Если кэш заполнен — использует его, не читая БД.
+        Если кэш пуст — загружает из БД и сохраняет в class variable.
         """
+        # Проверяем кэш и значения
+        if HormonalVectorEncoder._cache_initialized:
+            omega = HormonalVectorEncoder._shared_omega
+            sigma = HormonalVectorEncoder._shared_sigma
+            
+            # Явная проверка значений для сужения типов (type narrowing)
+            if omega is not None and sigma is not None:
+                self.omega = omega.copy()
+                self.sigma = sigma
+                self.is_initialized = True
+                logger.debug("Using cached RFF parameters (sigma=%.4f)", self.sigma)
+
+        # Кэш пуст — загружаем из БД
         logger.debug("Loading RFF parameters from state.settings...")
 
         with psycopg2.connect(**self.db_config) as conn:
@@ -112,6 +146,11 @@ class HormonalVectorEncoder:
         else:
             logger.info("RFF omega not found or invalid. Generating new matrix...")
             self._generate_and_save_omega(settings)
+
+        # Сохраняем в class-level кэш
+        HormonalVectorEncoder._shared_omega = self.omega.copy()
+        HormonalVectorEncoder._shared_sigma = self.sigma
+        HormonalVectorEncoder._cache_initialized = True
 
         self.is_initialized = True
         logger.debug("HormonalVectorEncoder initialized successfully.")
@@ -194,3 +233,16 @@ class HormonalVectorEncoder:
             z[:] = 0.0
 
         return z.tolist()
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """
+        Очищает class-level кэш параметров.
+        
+        Используется при тестировании или перезагрузке конфигурации.
+        После вызова следующий экземпляр энкодера загрузит параметры из БД заново.
+        """
+        cls._shared_omega = None
+        cls._shared_sigma = None
+        cls._cache_initialized = False
+        logger.debug("HormonalVectorEncoder cache cleared.")

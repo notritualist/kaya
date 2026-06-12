@@ -14,7 +14,7 @@ Sequence:
 8. Run console interface with lifecycle integration
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 __description__ = "Main launch module of agent"
 
 import sys
@@ -26,6 +26,8 @@ from interfaces.console_interface import run_console_interface
 from orchestrator.orchestrator import start_orchestrator
 from session_services.session_manager import SessionManager
 from phs_service.lifecycle_manager import LifecycleManager
+from phs_service.momentary_manager import MomentaryManager
+
 
 
 def setup_logging():
@@ -112,7 +114,11 @@ def main():
 
         # 4. Очистка зависших до рестарта сессий
         SessionManager.close_dangling_sessions(postgres_config)
-
+        # Очистка зависших momentary (без осаждения, только сброс флагов)
+        # Осаждение выполняется в lifecycle_manager при детекции креша
+        momentary_mgr = MomentaryManager(postgres_config)
+        momentary_mgr.close_dangling_momentary()
+        
         # 5. Запуск цикла оркестратора
         start_orchestrator()
 
