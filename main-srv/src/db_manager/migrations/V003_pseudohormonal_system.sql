@@ -105,9 +105,9 @@ COMMENT ON COLUMN state.settings.updated_at IS 'Время последнего 
 -- Вставка параметров по умолчанию с описаниями
 INSERT INTO state.settings (param_name, value_float, value_text, value_json, description) VALUES
     -- Времена затухания (секунды)
-    ('tau_cortisol_sec',   3600.0, NULL, NULL, 'Время затухания кортизола в momentary слое (сек). Определяет скорость возврата momentary к значению baseline.'),
-    ('tau_dopamine_sec',   180.0,  NULL, NULL, 'Время затухания дофамина в momentary слое (сек). Определяет скорость возврата momentary к значению baseline.'),
-    ('tau_oxytocin_sec',   600.0, NULL, NULL, 'Время затухания окситоцина в momentary слое (сек). Определяет скорость возврата momentary к значению baseline.'),
+    ('tau_cortisol_sec',   3600.0, NULL, NULL, 'Время полураспада кортизола в momentary слое (сек). Определяет скорость биохимического распада.'),
+    ('tau_dopamine_sec',   180.0,  NULL, NULL, 'Время полураспада дофамина в momentary слое (сек). Определяет скорость биохимического распада.'),
+    ('tau_oxytocin_sec',   600.0, NULL, NULL, 'Время полураспада окситоцина в momentary слое (сек). Определяет скорость биохимического распада.'),
     ('phs_hourly_drift_interval_sec', 3600.0, NULL, NULL, 'Интервал ежечасного дрейфа baseline и осаждения всех momentary (сек). Задача phs_baseline_drift.'),
     ('baseline_ou_speed', 0.15, NULL, NULL, 'Скорость возврата baseline к уставке (setpoint) при естественном дрейфе (OU-процесс). 
     Доля разницы (уставка − текущее значение), компенсируемая за один шаг дрейфа.'),
@@ -122,14 +122,18 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     ('momentary_drift_noise', 0.4, NULL, NULL, 'Масштаб случайного шума при затухании momentary. Добавляет микрофлуктуации. 
     Рекомендуемое значение: 0.4 — чуть выше, чем у baseline (0.3), так как momentary более лабилен и подвержен быстрым колебаниям.'),
     ('absence_max_effect_hours', 96.0, NULL, NULL, 'Время до депрессии при отсутствии пользователя в выключенном состоянии (например 96ч = 4 дня)'),
-    
     -- Физиологические минимумы и параметры
     ('min_cortisol', 5.0, NULL, NULL, 'Минимальный естественный уровень кортизола. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
     ('min_dopamine', 10.0, NULL, NULL, 'Минимальный естественный уровень дофамина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
     ('min_oxytocin', 10.0, NULL, NULL, 'Минимальный естественный уровень окситоцина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
     -- Коэффициенты осаждения в baseline (α)
-    ('alpha_momentary_decay', 0.05, NULL, NULL, 'Коэффициент затухания momentary к baseline за один тик. Формула: new = baseline + (momentary - baseline) * (1 - alpha). 
-    Значение 0.05 = 5% разницы за тик. Применяется ко всем активным momentary пользователей'),
+    ('alpha_momentary_decay', 0.05, NULL, NULL, 'Глобальный коэффициент затухания momentary к baseline за один тик. 
+    Формула: new = baseline + (momentary - baseline) * (1 - alpha * decay_hormone) + noise. Значение 0.05 = 5% разницы закрывается за тик.'),
+    ('alpha_hourly_drift', 0.2, NULL, NULL, 'Коэффициент осаждения momentary в baseline при ежечасном дрейфе каждого пользователя. 
+    Малое значение, чтобы не мешать OU-дрейфу к уставкам.'),
+    ('alpha_session_end', 0.2, NULL, NULL, 'Коэффициент осаждения momentary в baseline при завершении сессии. Умеренный вклад опыта сессии.'),
+    ('alpha_crash_recovery', 0.1, NULL, NULL, 'Коэффициент осаждения momentary в baseline при восстановлении после креша. Осторожное обновление.'),
+
     -- Порог бездействия для перехода в sleep (минуты)
     ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователя, после которых агент переходит из active в sleep.'),
     ('dialogue_inactivity_timeout_minutes', 20.0, NULL, NULL, 'Таймаут неактивности диалога в минутах для пользователя. Если last_activity_at старше порога, 

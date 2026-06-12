@@ -26,7 +26,7 @@ Dependencies:
 DB schema: migration V003
 Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.2.0"
+version = "1.2.1"
 description = "Global agent lifecycle manager"
 
 import logging
@@ -369,7 +369,10 @@ class LifecycleManager:
         momentary_mgr = MomentaryManager(self.db_config)
 
         # === 1. Осаждение momentary в baseline ===
-        momentary_mgr.sediment_momentary_to_baseline(actor_id=actor_id, reason_code="session_end_sedimentation")
+        alpha = self._get_setting_float("alpha_session_end", default=0.2)
+        momentary_mgr.sediment_momentary_to_baseline(
+            actor_id=actor_id, alpha=alpha, reason_code="session_end_sedimentation"
+        )
 
         # === 2. Деактивация momentary ===
         # Сбрасываем is_active, чтобы при следующем запуске не было warning о dangling

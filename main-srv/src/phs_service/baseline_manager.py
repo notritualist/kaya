@@ -4,17 +4,23 @@ main-srv/src/phs_service/baseline_manager.py
 Long-term Hormonal Background (Baseline) Manager.
 
 Functions:
-    - Initialize baseline on cold start.
-    - Read and update the active record.
-    - Apply natural drift (Ornstein-Uhlenbeck process with return to setpoint).
-    - Protect against exceeding physiological boundaries.
-    - Create new baseline record with automatic state classification.
-        (Computes state_id via classifier and links to prototype.
-         Deactivates previous active record.)
+- Initialize baseline on cold start from setpoints (cortisol=50, dopamine=30, oxytocin=20).
+- Apply natural drift via Ornstein-Uhlenbeck process:
+    new = old + ou_speed * (setpoint - old) + noise.
+- Enforce physiological boundaries [min_*, 100.0] for all hormones.
+- Create NEW baseline records on every change (immutable history), deactivating the previous active record.
+- Automatic state classification: computes state_id via RFF vector cosine similarity to self_knowledge prototypes.
+- Handles offline drift on startup based on shutdown_type and downtime duration.
+- Full traceability: all operations return baseline_id_before and baseline_id_after in output_data.
+
+Architecture:
+- Single active baseline record at any time (enforced by is_active flag).
+- All mutations are INSERT+UPDATE (never UPDATE-in-place) to preserve state evolution history.
+- Integrates with MomentaryManager for hourly sedimentation of momentary experience.
 """
 
-version = "1.2.0"
-description = "Long-term Hormonal Background (Baseline) Manager"
+version = "1.2.1"
+description = "Hormonal Background (Baseline) Manager"
 
 import logging
 import random
@@ -287,16 +293,19 @@ class BaselineManager:
 
     def apply_hourly_sedimentation(self, actor_id: str, step_id: Optional[str] = None) -> Dict[str, Any]:
         """
-       Применяет ежечасное осаждение momentary в baseline.
+        Применяет ежечасное осаждение momentary в baseline.
         
-        Коэффициент alpha вычисляется динамически внутри sediment_momentary_to_baseline
-        как 1.0 / N_активных_сессий.
+        Использует ФИКСИРОВАННЫЙ коэффициент alpha_hourly_drift из настроек,
+        чтобы не перекрывать естественный дрейф baseline к уставкам.
         """
+        alpha = self._get_setting_float("alpha_hourly_drift", default=0.05)
+        if alpha <= 0.0:
+            return {"applied": False, "reason": "alpha_hourly_drift is zero"}
+        
         from phs_service.momentary_manager import MomentaryManager
-                       
         momentary_mgr = MomentaryManager(self.db_config)
         result = momentary_mgr.sediment_momentary_to_baseline(
-            actor_id=actor_id, reason_code="hourly_sedimentation"
+            actor_id=actor_id, alpha=alpha, reason_code="hourly_sedimentation"
         )
         
         if result:

@@ -23,7 +23,7 @@ Tables: users.actors, users.actors_external_ids, dialogs.sessions,
         dialogs.dialogues, dialogs.row_messages, state.momentary
 """
 
-version = "1.2.0"
+version = "1.2.1"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -32,7 +32,6 @@ from psycopg2.extras import RealDictCursor
 from typing import Optional
 from datetime import datetime, timezone
 from dialog_services.dialogue_manager import ensure_active_dialogue, close_active_dialogue
-from phs_service.momentary_manager import MomentaryManager
 from phs_service.phs_cache import get_momentary_manager
 
 # Логгер модуля — подхватит настройки из main.py
