@@ -21,7 +21,7 @@ Architecture:
 - Integrates with MomentaryManager for hourly sedimentation of momentary experience.
 """
 
-version = "1.3.1"
+version = "1.3.2"
 description = "Hormonal Background (Baseline) Manager"
 
 import logging
@@ -174,7 +174,15 @@ class BaselineManager:
             complete_task_success, complete_task_error
         )
 
-        step_id = create_orchestrator_step(task_id, 1, "phs_baseline_drift", input_data)
+        # Получаем baseline_id для штамповки шага
+        current_baseline = self.get_current_baseline()
+        baseline_id = str(current_baseline["id"]) if current_baseline else None
+
+        step_id = create_orchestrator_step(
+            task_id, 1, "phs_baseline_drift", input_data,
+            baseline_id=baseline_id,
+            momentary_id=None  # Фоновая задача ПГС, momentary не применим
+        )
         
         try:
             drift_type = input_data.get("drift_type")

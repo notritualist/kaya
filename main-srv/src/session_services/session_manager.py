@@ -4,31 +4,25 @@ main-srv/src/session_services/session_manager.py
 Session and dialog manager for agent interfaces.
 
 Responsible for:
-- Binding users (console:) to actors (owner/user) via users.actors_external_ids.
+- Binding users (console:<username>) to actors (owner/user) via users.actors_external_ids.
 - Creating physical connection sessions (dialogs.sessions).
-- Managing the dialog lifecycle via dialog_services.dialogue_manager:
-    * Lazy dialog creation on first message (ensure_active_dialogue).
-    * Automatic inactivity timeout check.
-    * Manual dialog termination (Ctrl+N / rotate_dialogue).
+- Managing the dialog lifecycle via dialog_services.dialogue_manager.
 - Saving messages in dialogs.row_messages with mandatory dialogue_id binding.
-- Triggering PHS momentary shifts on user_message events.
+- Stamping messages with current PHS snapshot (baseline_id, momentary_id).
 - Correctly ending dialogs and sessions on exit.
 - Cleaning up frozen sessions and dialogs when restarting the agent.
-- Updating session activity timestamp (update_activity).
-- Blocking wait for agent response via wait_for_agent_response.
 
 PHS Integration:
 - Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
+- Stamps user messages with current baseline_id and momentary_id via get_current_phs_snapshot().
 - Triggers momentary shift 'user_message' after successful message save.
-- SessionManager does NOT perform PHS calculations or DB writes to state.momentary directly.
-- Snapshot links to current baseline and actor context are handled by MomentaryManager.
-- Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
+- SessionManager does NOT perform PHS calculations directly.
 
-Tables: users.actors, users.actors_external_ids, dialogs.sessions, 
-        dialogs.dialogues, dialogs.row_messages, state.momentary
+Tables: users.actors, users.actors_external_ids, dialogs.sessions,
+        dialogs.dialogues, dialogs.row_messages, state.momentary, state.baseline_phs
 """
 
-version = "1.2.3"
+version = "1.3.0"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -405,15 +399,16 @@ class SessionManager:
         """
         Сохраняет сообщение пользователя в dialogs.row_messages.
         Автоматически обеспечивает наличие активного диалога (V002).
+        Штампует сообщение текущими baseline_id и momentary_id (V004).
         
         Заполняет поля согласно миграциям БД:
         - actor_id, actor_type (из self.actor_type: 'owner' или 'user')
         - session_id
         - dialogue_id (автоматически через ensure_active_dialogue)
         - row_text (сырой текст)
+        - baseline_id, momentary_id (текущий гормональный срез)
         - agent_version, timestamp
                
-        Применяет сдвиг momentary ПГС как факт сообщения.
         Args:
             content: текст сообщения
             
@@ -473,33 +468,41 @@ class SessionManager:
                             f"user_think_latency: {user_think_latency:.2f} sec"
                         )
             
-            # === ШАГ 2: Вставляем сообщение с dialogue_id ===
+            # === ШАГ 2: Получаем штампы ПГС для сообщения ===
+            from phs_service.phs_cache import get_current_phs_snapshot
+            baseline_id, momentary_id = get_current_phs_snapshot(self.db_config, self.actor_id)
+            
+            # === ШАГ 3: Вставляем сообщение с dialogue_id и PHS-штампами ===
             row = self._query("""
                 INSERT INTO dialogs.row_messages 
                 (
                     parent_message_id,
                     actor_id, 
                     actor_type, 
-                    session_id,
+                    session_id, 
                     dialogue_id,  
                     row_text,
                     answer_latency,
                     agent_version, 
                     orchestrator_step_id,
+                    baseline_id,
+                    momentary_id,
                     timestamp
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, params=(
                 parent_message_id,
                 self.actor_id,
                 self.actor_type,
                 self.session_id,
-                self.current_dialogue_id, # V002: ID диалога
-                content,              # row_text — сырой текст
+                self.current_dialogue_id,
+                content,
                 user_think_latency,
                 self.agent_version,
                 None,                  # orchestrator_step_id
+                baseline_id,           # ← PHS штамп
+                momentary_id,          # ← PHS штамп
                 datetime.now(timezone.utc),
             ), fetch=True)
             

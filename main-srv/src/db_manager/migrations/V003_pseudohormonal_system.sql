@@ -8,6 +8,8 @@
 -- Extends momentary, sessions, dialogues with state tracking fields.
 -- Implements hourly sedimentation support and crash recovery fields.
 -- Creates settings schema and orchestrator configuration table with PULSE_SECONDS constant.
+-- Adding hormonal slice stamps (baseline_id, momentary_id)
+-- to all significant agent events for full state traceability.
 -- =============================================
 
 -- =============================================
@@ -600,3 +602,62 @@ CREATE TRIGGER trg_orchestrator_config_update_updated_at
 INSERT INTO settings.orchestrator_config (param_name, value_float, description) VALUES
 ('orchestrator_pulse_seconds', 1.0, 'Интервал между проверками очереди задач оркестратора (в секундах). Аналог пульса человека. Значение по умолчанию: 1.')
 ON CONFLICT (param_name) DO NOTHING;
+
+
+-- =============================================
+-- 17. Штампы ПГС в таблицу сообщений диалогов
+-- =============================================
+ALTER TABLE dialogs.row_messages
+ADD COLUMN IF NOT EXISTS baseline_id UUID REFERENCES state.baseline_phs(id) ON DELETE SET NULL,
+ADD COLUMN IF NOT EXISTS momentary_id UUID REFERENCES state.momentary(id) ON DELETE SET NULL;
+
+COMMENT ON COLUMN dialogs.row_messages.baseline_id IS 'Долговременный гормональный фон (baseline) на момент отправки/получения сообщения. Позволяет анализировать влияние личностных черт на коммуникацию.';
+COMMENT ON COLUMN dialogs.row_messages.momentary_id IS 'Моментальный гормональный срез (momentary) на момент отправки/получения сообщения. Отражает сиюминутное эмоциональное состояние в диалоге.';
+
+-- Индексы для анализа корреляции состояний и стиля общения
+CREATE INDEX IF NOT EXISTS idx_row_messages_baseline ON dialogs.row_messages (baseline_id);
+CREATE INDEX IF NOT EXISTS idx_row_messages_momentary ON dialogs.row_messages (momentary_id);
+CREATE INDEX IF NOT EXISTS idx_row_messages_phs_composite ON dialogs.row_messages (baseline_id, momentary_id) WHERE momentary_id IS NOT NULL;
+
+-- =============================================
+-- 18. Штампы ПГС в таблицу задач оркестратора
+-- =============================================
+ALTER TABLE orchestrator.orchestrator_tasks
+ADD COLUMN IF NOT EXISTS baseline_id UUID REFERENCES state.baseline_phs(id) ON DELETE SET NULL,
+ADD COLUMN IF NOT EXISTS momentary_id UUID REFERENCES state.momentary(id) ON DELETE SET NULL;
+
+COMMENT ON COLUMN orchestrator.orchestrator_tasks.baseline_id IS 'Гормональный фон (baseline) на момент создания задачи. Позволяет отследить, в каком состоянии агент планировал действия.';
+COMMENT ON COLUMN orchestrator.orchestrator_tasks.momentary_id IS 'Моментальное состояние (momentary) на момент создания задачи. NULL для фоновых задач ПГС (drift, decay).';
+
+-- Индексы для анализа влияния состояний на приоритеты и типы задач
+CREATE INDEX IF NOT EXISTS idx_orchestrator_tasks_baseline ON orchestrator.orchestrator_tasks (baseline_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_tasks_momentary ON orchestrator.orchestrator_tasks (momentary_id) WHERE momentary_id IS NOT NULL;
+
+-- =============================================
+-- 19. Штампы ПГС в таблицу шагов оркестратора
+-- =============================================
+ALTER TABLE orchestrator.orchestrator_steps
+ADD COLUMN IF NOT EXISTS baseline_id UUID REFERENCES state.baseline_phs(id) ON DELETE SET NULL,
+ADD COLUMN IF NOT EXISTS momentary_id UUID REFERENCES state.momentary(id) ON DELETE SET NULL;
+
+COMMENT ON COLUMN orchestrator.orchestrator_steps.baseline_id IS 'Гормональный фон (baseline) на момент выполнения шага. Связывает технические операции с эмоциональным контекстом.';
+COMMENT ON COLUMN orchestrator.orchestrator_steps.momentary_id IS 'Моментальное состояние (momentary) на момент выполнения шага. NULL для фоновых операций ПГС.';
+
+-- Индексы для анализа производительности LLM в разных состояниях
+CREATE INDEX IF NOT EXISTS idx_orchestrator_steps_baseline ON orchestrator.orchestrator_steps (baseline_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_steps_momentary ON orchestrator.orchestrator_steps (momentary_id) WHERE momentary_id IS NOT NULL;
+
+-- =============================================
+-- 20. Штампы ПГС в таблицу рассуждений агента
+-- =============================================
+ALTER TABLE orchestrator.reasonings
+ADD COLUMN IF NOT EXISTS baseline_id UUID REFERENCES state.baseline_phs(id) ON DELETE SET NULL,
+ADD COLUMN IF NOT EXISTS momentary_id UUID REFERENCES state.momentary(id) ON DELETE SET NULL;
+
+COMMENT ON COLUMN orchestrator.reasonings.baseline_id IS 'Гормональный фон (baseline) на момент генерации рассуждения. Позволяет анализировать влияние личностных черт на ход мыслей.';
+COMMENT ON COLUMN orchestrator.reasonings.momentary_id IS 'Моментальное состояние (momentary) на момент генерации рассуждения. Критично для понимания эмоционального контекста саморефлексии.';
+
+-- Индексы для семантического поиска рассуждений по состоянию
+CREATE INDEX IF NOT EXISTS idx_reasonings_baseline ON orchestrator.reasonings (baseline_id);
+CREATE INDEX IF NOT EXISTS idx_reasonings_momentary ON orchestrator.reasonings (momentary_id) WHERE momentary_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_reasonings_phs_composite ON orchestrator.reasonings (baseline_id, momentary_id) WHERE momentary_id IS NOT NULL;

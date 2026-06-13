@@ -2,23 +2,25 @@
 main-srv/src/orchestrator/response_composer.py
 
 Module for generating the final response to the user.
+
 Logic:
 - Get the user's message from the database
 - Get the prompt and generation parameters from orchestrator.prompts.params
 - Call ModelService.generate() with the parameters from the prompt
 - Process the response:
-- Extract <think/COT> → save to orchestrator.reasonings
-- Save the response to dialogs.messages
-- Trigger PHS momentary shift 'agent_response' after successful save
+  * Extract <think/COT> → save to orchestrator.reasonings (with PHS stamps)
+  * Save the response to dialogs.row_messages (with PHS stamps)
+  * Trigger PHS momentary shift 'agent_response' after successful save
 - Write metrics to metrics.llm_internal and the orchestrator step
 - Complete the orchestrator task/step
 
 PHS Integration:
+- Stamps agent responses with current baseline_id and momentary_id via get_current_phs_snapshot().
 - Triggers momentary shift 'agent_response' via phs_cache after saving the response.
 - Does NOT perform PHS calculations directly.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Module for generating the final response to the user"
 
 
@@ -122,6 +124,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     Генерация финального ответа пользователю.
     
     Применяет сдвиг momentary (agent_response) к ПГС агента при сохранении сообщения.
+    Сохраняет штампы momentary b baseline ПГС.
     Args:
         task_id (str): UUID задачи оркестратора
         input_data (dict): {"message_id": "<uuid>"}
@@ -258,6 +261,10 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         count_tokens_qwen(user_content)
     )
 
+    # === 4.2 Получаем штампы ПГС для шага, ответа и рассуждений ===
+    from phs_service.phs_cache import get_current_phs_snapshot
+    baseline_id, momentary_id = get_current_phs_snapshot(db_config, user_actor_id)
+
     # === 5. Создание шага оркестратора ===
     step_input = {
         "message_id": message_id,
@@ -270,7 +277,9 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         task_id=task_id,
         step_number=1,
         step_type_name="user_answer_generation",
-        input_data=step_input
+        input_data=step_input,
+        baseline_id=baseline_id,      # ← PHS штамп
+        momentary_id=momentary_id     # ← PHS штамп
     )
 
     # === 6. Вызов модели ===
@@ -332,14 +341,20 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         clean_response = "[Empty response]"
         logger.warning("Generated response is empty")
 
+    # === 8.1 Получаем штампы ПГС для ответа и рассуждений ===
+    from phs_service.phs_cache import get_current_phs_snapshot
+    baseline_id, momentary_id = get_current_phs_snapshot(db_config, user_actor_id)
+    
     # === 9. Сохранение рассуждений (если есть) ===
     reasoning_id = None
     if reasoning_text and reasoning_text.strip():
+        # Рассуждение штампуется тем же PHS-срезом, что и ответ
         reasoning_id = save_reasoning(
             orchestrator_step_id=step_id,
             content=reasoning_text.strip(),
             content_type="messages",
-            for_actor_id=user_actor_id
+            baseline_id=baseline_id,      # ← PHS штамп (получен на шаге 12)
+            momentary_id=momentary_id     # ← PHS штамп
         )
         if reasoning_id:
             set_step_reasoning_id(step_id, reasoning_id)
@@ -398,9 +413,11 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                         row_text,
                         answer_latency,
                         orchestrator_step_id,
+                        baseline_id,
+                        momentary_id,
                         agent_version,
                         timestamp
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     message_id,
@@ -412,6 +429,8 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                     clean_response,
                     answer_latency,
                     step_id,
+                    baseline_id,           # ← PHS штамп
+                    momentary_id,          # ← PHS штамп
                     agent_version,
                     answer_timestamp
                 ))

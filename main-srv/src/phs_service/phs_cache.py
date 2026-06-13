@@ -1,24 +1,28 @@
 """
 main-srv/src/phs_service/phs_cache.py
 
-Global cache of PHS manager instances.
+PHS Managers Cache and Utility Functions.
 
-Purpose:
-    Prevents creating multiple manager instances with each call.
-    Ensures reuse of HormonalVectorEncoder with class-level parameter caching.
-    Eliminates repeated reads of state.settings and state.baseline_phs.
+Features:
+- Singleton cache for BaselineManager, MomentaryManager, LifecycleManager instances.
+- Avoids repeated DB config loading and manager initialization.
+- Thread-safe lazy initialization.
+- Provides utility function get_current_phs_snapshot() for stamping messages,
+  tasks, steps, and reasonings with current hormonal state IDs.
 
 Architecture:
-    Module-level cache using a dictionary with string keys.
-    get_* functions return a cached instance or create a new one.
-    clear_cache() for resetting during testing or config reload.
+- Global dict _cache stores manager instances.
+- get_*_manager() functions return cached or create new instances.
+- get_current_phs_snapshot() is stateless, executes single DB query.
 """
 
-version = "1.0.0"
-description = "Global cache of PHS manager"
+version = "1.1.0"
+description = "PHS Managers Cache and Utility Functions module"
 
 import logging
-from typing import Dict, Any
+import psycopg2
+from typing import Dict, Any, Optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -91,3 +95,50 @@ def clear_cache() -> None:
     _cache.clear()
     HormonalVectorEncoder.clear_cache()
     logger.debug("PHS cache cleared")
+
+
+def get_current_phs_snapshot(db_config: dict, actor_id: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """
+    Возвращает кортеж (baseline_id, momentary_id) для текущего состояния агента.
+    
+    Используется для штамповки сообщений, задач, шагов и рассуждений.
+    
+    Логика:
+    1. baseline_id — всегда берется активный baseline (is_active=TRUE).
+    2. momentary_id — если передан actor_id, берется активный momentary для него.
+       Если actor_id=None (фоновые задачи ПГС) — momentary_id будет None.
+    
+    Args:
+        db_config: Параметры подключения к PostgreSQL.
+        actor_id: UUID актора (пользователя) для поиска momentary. Может быть None.
+        
+    Returns:
+        tuple[str | None, str | None]: (baseline_id, momentary_id).
+            Оба могут быть None, если система еще не инициализирована.
+    """
+    baseline_id = None
+    momentary_id = None
+    
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                # 1. Получаем активный baseline
+                cur.execute("SELECT id FROM state.baseline_phs WHERE is_active = TRUE LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    baseline_id = str(row[0])
+                
+                # 2. Получаем активный momentary для актора (если задан)
+                if actor_id:
+                    cur.execute(
+                        "SELECT id FROM state.momentary WHERE actor_id = %s AND is_active = TRUE LIMIT 1",
+                        (actor_id,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        momentary_id = str(row[0])
+    except Exception as e:
+        # Ошибка получения PHS-среза не должна ломать основную операцию
+        logger.warning(f"Failed to get PHS snapshot: {e}")
+        
+    return baseline_id, momentary_id

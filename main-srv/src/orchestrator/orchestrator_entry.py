@@ -7,18 +7,23 @@ Single entry point for creating orchestrator tasks.
 All modules (session_manager, phs_scheduler, lifecycle_manager) must use this interface instead of direct SQL INSERT.
 
 Supported task types:
-    user_answer_generation: generates the final response to the user.
-    phs_baseline_drift: natural baseline drift (OU process + sedimentation).
-    phs_momentary_decay: momentary decay to baseline.
+- user_answer_generation: generates the final response to the user.
+- phs_baseline_drift: natural baseline drift (OU process + sedimentation).
+- phs_momentary_decay: momentary decay to baseline.
 
 Architecture:
-    Generic function create_orchestrator_task() with task_type validation.
-    Specialized wrappers: on_user_message / schedule_phs_baseline_drift / schedule_phs_momentary_decay.
-    Lifecycle activity recorded with actor_id from the message.
-    Agent version passed globally via version.py.
+- Generic function create_orchestrator_task() with task_type validation.
+- Specialized wrappers: on_user_message / schedule_phs_baseline_drift / schedule_phs_momentary_decay.
+- All tasks are stamped with current PHS snapshot (baseline_id, momentary_id) via V004.
+- For dialog-bound tasks (user_answer_generation), momentary_id is populated.
+- For background PHS tasks, momentary_id may be NULL.
+
+Lifecycle integration:
+- Activity recorded with actor_id from the message.
+- Agent version passed globally via version.py.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
@@ -36,24 +41,21 @@ logger = logging.getLogger(__name__)
 
 def on_user_message(message_id: str) -> str:
     """
-   Создаёт задачу оркестратору и фиксирует активность для lifecycle.
-    
+    Создаёт задачу оркестратору и фиксирует активность для lifecycle.
+    Автоматически штампует задачу текущим состоянием ПГС (baseline_id, momentary_id).
+
     Логика:
     1. Валидация message_id
     2. Загрузка actor_id из dialogs.row_messages
     3. Фиксация активности через LifecycleManager.record_activity
-    4. Создание задачи user_answer_generation
-    
+    4. Получение PHS-среза для actor_id
+    5. Создание задачи user_answer_generation с PHS-штампами
+
     Args:
         message_id: UUID сообщения из dialogs.row_messages
-    
+
     Returns:
         str: UUID созданной задачи в orchestrator.orchestrator_tasks
-    
-    Raises:
-        ValueError: если message_id пустой или недействительный
-        RuntimeError: если сообщение или тип задачи не найдены
-        psycopg2.Error: при ошибках БД
     """
     if not message_id or not isinstance(message_id, str):
         raise ValueError("message_id must be a non-empty string")
@@ -92,7 +94,11 @@ def on_user_message(message_id: str) -> str:
                 )
             task_type_id = row["id"]
 
-            # === 4. Создаём задачу ===
+            # === 4. Получаем PHS-срез для actor_id ===
+            from phs_service.phs_cache import get_current_phs_snapshot
+            baseline_id, momentary_id = get_current_phs_snapshot(db_config, actor_id)
+            
+            # === 5. Создаём задачу с PHS-штампами ===
             priority = 0.7
 
             cur.execute("""
@@ -101,6 +107,8 @@ def on_user_message(message_id: str) -> str:
                     input_data,
                     priority,
                     status,
+                    baseline_id,
+                    momentary_id,
                     agent_version,
                     created_at
                 ) VALUES (
@@ -108,14 +116,18 @@ def on_user_message(message_id: str) -> str:
                     %(input_data)s,
                     %(priority)s,
                     'pending',
+                    %(baseline_id)s,
+                    %(momentary_id)s,
                     %(agent_version)s,
                     NOW()
                 )
                 RETURNING id
             """, {
                 "task_type_id": task_type_id,
-                "input_data": Json({"message_id": message_id}),  # ← ВОТ ТАК
+                "input_data": Json({"message_id": message_id}),
                 "priority": priority,
+                "baseline_id": baseline_id,
+                "momentary_id": momentary_id,
                 "agent_version": agent_version
             })
 
@@ -147,23 +159,27 @@ def on_user_message(message_id: str) -> str:
 def create_orchestrator_task(
     task_type_name: str,
     input_data: Dict[str, Any],
-    priority: float = 0.5
+    priority: float = 0.5,
+    baseline_id: Optional[str] = None,
+    momentary_id: Optional[str] = None
 ) -> str:
     """
     Универсальная функция создания задачи оркестратора.
-    
     Единственная точка входа для создания задач. Все модули должны
     использовать эту функцию вместо прямого INSERT.
-    
+    Опционально штампует задачу текущим состоянием ПГС.
+
     Логика:
     1. Проверка существования типа задачи в orchestrator.task_types
-    2. Создание записи в orchestrator.orchestrator_tasks
+    2. Создание записи в orchestrator.orchestrator_tasks с PHS-штампами
     3. Возврат UUID созданной задачи
-    
+
     Args:
         task_type_name: Имя типа задачи (user_answer_generation, phs_baseline_drift, etc.)
         input_data: Данные для задачи (message_id, drift_type, etc.)
         priority: Приоритет задачи (0.0-1.0, по умолчанию 0.5)
+        baseline_id: UUID активного baseline (V004, опционально)
+        momentary_id: UUID активного momentary (V004, опционально)
         
     Returns:
         str: UUID созданной задачи
@@ -190,15 +206,16 @@ def create_orchestrator_task(
                     )
                 task_type_id = row["id"]
                 
-                # 2. Создаём задачу
+                # 2. Создаём задачу с PHS-штампами
                 cur.execute("""
                     INSERT INTO orchestrator.orchestrator_tasks (
-                        task_type_id, input_data, priority, status, agent_version, created_at
+                        task_type_id, input_data, priority, status, 
+                        baseline_id, momentary_id, agent_version, created_at
                     ) VALUES (
-                        %s, %s, %s, 'pending', %s, NOW()
+                        %s, %s, %s, 'pending', %s, %s, %s, NOW()
                     )
                     RETURNING id
-                """, (task_type_id, Json(input_data), priority, agent_version))
+                """, (task_type_id, Json(input_data), priority, baseline_id, momentary_id, agent_version))
                 
                 task_id = str(cur.fetchone()["id"])
                 conn.commit()
@@ -212,7 +229,8 @@ def create_orchestrator_task(
     except psycopg2.Error as e:
         logger.error(f"Database error creating orchestrator task: {e}", exc_info=True)
         raise RuntimeError(f"Failed to create orchestrator task: {e}") from e
-    
+
+
 def schedule_phs_baseline_drift(
     drift_type: str,
     baseline_id: Optional[str] = None,

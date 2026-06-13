@@ -1,30 +1,23 @@
 """
 main-srv/src/services/service_metrics.py
 
-Helper functions for working with orchestrator metrics and statuses.
+Utility module for updating statuses and saving metrics.
 
 Module responsibilities:
 - Update task and step statuses in orchestrator.orchestrator_tasks / _steps
 - Store LLM query metrics in metrics.llm_internal
 - Store reasoning in orchestrator.reasonings
 - Bind reasoning and metrics to orchestrator steps
+- Stamp steps and reasonings with PHS snapshot (baseline_id, momentary_id) via V004
 
 Architecture:
-- All functions accept IDs and data, execute SQL queries, and return IDs or None
-- agent_version is imported from version.py, as in the entire project
-- Logging via logging.getLogger(__name__) → kaya_full.log
-
-Requirements:
-1. Migration V001 applied
-2. Access to PostgreSQL via psycopg2
-3. Imported modules: db_manager, version
-
-Usage example:
-step_id = create_orchestrator_step(task_id="...", step_type_name="user_answer_generation", ...)
-    save_llm_metrics(orchestrator_step_id=step_id, prompt_id="...", ...)
+- All functions accept IDs and data, execute SQL queries, and return IDs or None.
+- PHS stamps (baseline_id, momentary_id) are optional parameters.
+- For dialog-bound operations, callers should pass PHS IDs from get_current_phs_snapshot().
+- For background PHS tasks (drift, decay), stamps may be None.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Utility module for updating statuses and saving metrics"
 
 import logging
@@ -95,6 +88,7 @@ def complete_task_success(task_id: str, output_data: Optional[Dict[str, Any]] = 
             conn.commit()
     logger.info("Task %s completed successfully", task_id[:8])
 
+
 def complete_task_error(
         task_id: str,
         error_module: str,
@@ -133,16 +127,21 @@ def create_orchestrator_step(
     task_id: str,
     step_number: int,
     step_type_name: str,
-    input_data: Optional[Dict[str, Any]] = None
+    input_data: Optional[Dict[str, Any]] = None,
+    baseline_id: Optional[str] = None,
+    momentary_id: Optional[str] = None
 ) -> str:
     """
     Создаёт новый шаг оркестратора для задачи.
+    Опционально штампует шаг текущим состоянием ПГС.
     
     Args:
         task_id (str): UUID родительской задачи
         step_number (int): Порядковый номер шага в задаче (начинается с 1)
         step_type_name (str): Имя типа шага из orchestrator.step_types.step_name
         input_data (dict, optional): Входные данные шага в формате JSON
+        baseline_id (str, optional): UUID активного baseline (V004)
+        momentary_id (str, optional): UUID активного momentary (V004)
         
     Returns:
         str: UUID созданного шага
@@ -160,7 +159,7 @@ def create_orchestrator_step(
                 raise RuntimeError(f"Step type '{step_type_name}' not found in orchestrator.step_types")
             step_type_id = row[0]
             
-            # Создаём шаг
+            # Создаём шаг с PHS-штампами
             cur.execute("""
                 INSERT INTO orchestrator.orchestrator_steps (
                     task_id,
@@ -168,10 +167,12 @@ def create_orchestrator_step(
                     step_type_id,
                     status,
                     input_data,
+                    baseline_id,
+                    momentary_id,
                     agent_version,
                     created_at
                 ) VALUES (
-                    %s, %s, %s, 'pending'::task_status, %s, %s, NOW()
+                    %s, %s, %s, 'pending'::task_status, %s, %s, %s, %s, NOW()
                 )
                 RETURNING id
             """, (
@@ -179,6 +180,8 @@ def create_orchestrator_step(
                 step_number,
                 step_type_id,
                 Json(input_data) if input_data else None,
+                baseline_id,
+                momentary_id,
                 agent_version
             ))
             step_id = str(cur.fetchone()[0])
@@ -361,16 +364,20 @@ def save_reasoning(
     orchestrator_step_id: str,
     content: str,
     content_type: str,  # 'messages', 'reflection', 'second_reflection'
-    for_actor_id: Optional[str] = None
+    baseline_id: Optional[str] = None,
+    momentary_id: Optional[str] = None
 ) -> Optional[str]:
     """
     Сохраняет рассуждение (Chain of Thought) в orchestrator.reasonings.
+    Опционально штампует рассуждение текущим состоянием ПГС.
     
     Args:
         orchestrator_step_id (str): UUID шага, в рамках которого сгенерировано рассуждение
         content (str): Текст рассуждения
         content_type (str): Тип рассуждения из ENUM reasoning_content_type
         for_actor_id (str, optional): ID актора, для которого предназначено рассуждение
+        baseline_id (str, optional): UUID активного baseline (V004)
+        momentary_id (str, optional): UUID активного momentary (V004)
         
     Returns:
         str | None: UUID записи рассуждения или None, если не сохранено
@@ -386,16 +393,20 @@ def save_reasoning(
                     orchestrator_step_id,
                     reasoning_content,
                     reasoning_content_type,
+                    baseline_id,
+                    momentary_id,
                     agent_version,
                     timestamp
                 ) VALUES (
-                    %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, NOW()
                 )
                 RETURNING id
             """, (
                 orchestrator_step_id,
                 content,
                 content_type,
+                baseline_id,
+                momentary_id,
                 agent_version
             ))
             reasoning_id = str(cur.fetchone()[0])

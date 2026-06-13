@@ -495,7 +495,15 @@ class MomentaryManager:
         2. Вызывает apply_decay_tick для всех активных акторов.
         3. Завершает задачу с полным отчётом в output_data.
         """
-        step_id = create_orchestrator_step(task_id, 1, "phs_momentary_decay", input_data)
+        # Получаем baseline_id для штамповки шага
+        current_baseline = self.baseline_mgr.get_current_baseline()
+        baseline_id = str(current_baseline["id"]) if current_baseline else None
+
+        step_id = create_orchestrator_step(
+            task_id, 1, "phs_momentary_decay", input_data,
+            baseline_id=baseline_id,
+            momentary_id=None  # Фоновая задача ПГС, конкретный momentary не применим
+        )
         
         try:
             result = self.apply_decay_tick(step_id=step_id)
