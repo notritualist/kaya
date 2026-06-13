@@ -33,7 +33,7 @@ Architecture:
 - event_payload is freely writable: can contain prompt_description or custom code-generated text.
 """
 
-version = "1.2.1"
+version = "1.2.2"
 description = "Momentary hormonal state manager"
 
 import logging
@@ -749,18 +749,22 @@ class MomentaryManager:
         step_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Применяет сдвиг momentary на основе диалогового события.
-        Читает параметры сдвига из state.settings (value_json).
+        Применяет сдвиг momentary на основе события из state.delta_reasons.
+        Универсальный метод: работает с диалоговыми событиями (dialog_start, dialog_end),
+        событиями сообщений (user_message, agent_response) и глобальными (agent_stop).
+        
+        Читает параметры сдвига из state.settings (value_json) по ключу momentary_shift_{event_code}.
         
         Логика:
         1. Находит активный momentary для actor_id.
-        2. Читает JSON сдвига из state.settings (momentary_shift_{event_code}).
+        2. Читает JSON сдвига из state.settings.
         3. Применяет сдвиг с учетом физиологических границ [0..100].
         4. Пересчитывает valence, vector, state_id.
         5. Создает новую запись momentary, деактивирует старую.
+        6. Применяем сдвиги С УЧЕТОМ НАСЫЩЕНИЯ РЕЦЕПТОРОВ (ГАБИТУАЦИЯ)
         
         Args:
-            event_code: Код события ('dialog_start', 'dialog_end', 'dialogue_timeout').
+            event_code: Код события из state.delta_reasons.event_type_code.
             actor_id: UUID пользователя.
             step_id: UUID шага оркестратора (опционально).
             
@@ -803,11 +807,26 @@ class MomentaryManager:
 
         before_id = str(current_m["id"])
         
-        # 3. Применяем сдвиги
+        # 3. Применяем сдвиги С УЧЕТОМ НАСЫЩЕНИЯ РЕЦЕПТОРОВ (ГАБИТУАЦИЯ)
+        # Биологический смысл: чем выше текущий уровень гормона, тем слабее 
+        # реакция на новый стимул (логистическое насыщение).
+        # Формула: effective_shift = base_shift * (1.0 - current_level / 100.0)
         new_hormones = {}
         for h in ["cortisol", "dopamine", "oxytocin"]:
-            shift_val = float(shifts.get(h, 0.0))
-            h_new = current_m[h] + shift_val
+            base_shift = float(shifts.get(h, 0.0))
+            current_level = current_m[h]
+            
+            # Коэффициент насыщения: от 1.0 (при уровне 0) до 0.0 (при уровне 100)
+            # Для отрицательных сдвигов (снижение) используем обратную логику:
+            # чем ниже уровень, тем сложнее его уронить дальше.
+            if base_shift >= 0:
+                saturation_factor = 1.0 - (current_level / 100.0)
+            else:
+                saturation_factor = current_level / 100.0
+                
+            effective_shift = base_shift * max(0.0, saturation_factor)
+            
+            h_new = current_level + effective_shift
             new_hormones[h] = max(0.0, min(100.0, h_new))
             
         logger.info(

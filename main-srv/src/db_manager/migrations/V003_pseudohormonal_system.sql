@@ -149,6 +149,10 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     (фрустрация, чувство игнорирования)'),
     ('momentary_shift_agent_stop', NULL, NULL, '{"cortisol": -5.0, "dopamine": -8.0, "oxytocin": 3.0}'::jsonb, 'Сдвиг momentary при штатном выключении агента 
     (расслабление, тёплое прощание, закрепление связи)'),
+    ('momentary_shift_user_message', NULL, NULL, '{"cortisol": 2.0, "dopamine": 5.0, "oxytocin": 3.0}'::jsonb, 'Сдвиг momentary при получении сообщения от 
+    пользователя (ориентировочная реакция, социальный стимул)'),
+    ('momentary_shift_agent_response', NULL, NULL, '{"cortisol": 1.0, "dopamine": 3.0, "oxytocin": 1.0}'::jsonb, 'Сдвиг momentary при генерации ответа агентом 
+    (волеусилие, экспрессия, социальная отдача)'),
     -- Порог бездействия для перехода в sleep (минуты)
     ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователей, после которых агент переходит из active в sleep.'),
     ('dialogue_inactivity_timeout_minutes', 20.0, NULL, NULL, 'Таймаут неактивности диалога в минутах для пользователя. Если last_activity_at старше порога, 

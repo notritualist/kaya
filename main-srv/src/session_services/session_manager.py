@@ -11,6 +11,7 @@ Responsible for:
     * Automatic inactivity timeout check.
     * Manual dialog termination (Ctrl+N / rotate_dialogue).
 - Saving messages in dialogs.row_messages with mandatory dialogue_id binding.
+- Triggering PHS momentary shifts on user_message events.
 - Correctly ending dialogs and sessions on exit.
 - Cleaning up frozen sessions and dialogs when restarting the agent.
 - Updating session activity timestamp (update_activity).
@@ -18,6 +19,7 @@ Responsible for:
 
 PHS Integration:
 - Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
+- Triggers momentary shift 'user_message' after successful message save.
 - SessionManager does NOT perform PHS calculations or DB writes to state.momentary directly.
 - Snapshot links to current baseline and actor context are handled by MomentaryManager.
 - Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
@@ -26,7 +28,7 @@ Tables: users.actors, users.actors_external_ids, dialogs.sessions,
         dialogs.dialogues, dialogs.row_messages, state.momentary
 """
 
-version = "1.2.2"
+version = "1.2.3"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -411,6 +413,7 @@ class SessionManager:
         - row_text (сырой текст)
         - agent_version, timestamp
                
+        Применяет сдвиг momentary ПГС как факт сообщения.
         Args:
             content: текст сообщения
             
@@ -506,7 +509,15 @@ class SessionManager:
             
             msg_id = str(row['id'])
             logger.debug(f"Message saved: {msg_id[:8]}")
-                  
+
+            # === PHS INTEGRATION: Применяем сдвиг momentary (user_message) ===
+            try:
+                momentary_mgr = get_momentary_manager(self.db_config)
+                momentary_mgr.apply_dialogue_event_shift('user_message', self.actor_id)
+            except Exception as e:
+                # Ошибка в ПГС не должна ломать сохранение сообщения
+                logger.warning(f"Failed to apply user_message PHS shift: {e}")
+
             return msg_id
             
         except ValueError as e:

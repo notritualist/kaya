@@ -9,11 +9,16 @@ Logic:
 - Process the response:
 - Extract <think/COT> → save to orchestrator.reasonings
 - Save the response to dialogs.messages
+- Trigger PHS momentary shift 'agent_response' after successful save
 - Write metrics to metrics.llm_internal and the orchestrator step
 - Complete the orchestrator task/step
+
+PHS Integration:
+- Triggers momentary shift 'agent_response' via phs_cache after saving the response.
+- Does NOT perform PHS calculations directly.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __description__ = "Module for generating the final response to the user"
 
 
@@ -115,6 +120,8 @@ def _build_history_context(db_config: dict, session_id: str, current_message_id:
 def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     """
     Генерация финального ответа пользователю.
+    
+    Применяет сдвиг momentary (agent_response) к ПГС агента при сохранении сообщения.
     Args:
         task_id (str): UUID задачи оркестратора
         input_data (dict): {"message_id": "<uuid>"}
@@ -411,6 +418,15 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                 response_id = str(cur.fetchone()[0])
                 conn.commit()
                 logger.info(f"Agent response saved: {response_id[:8]}, latency={answer_latency:.2f}s")
+
+                # === PHS INTEGRATION: Применяем сдвиг momentary (agent_response) ===
+                try:
+                    from phs_service.phs_cache import get_momentary_manager
+                    momentary_mgr = get_momentary_manager(db_config)
+                    momentary_mgr.apply_dialogue_event_shift('agent_response', user_actor_id)
+                except Exception as e:
+                    # Ошибка в ПГС не должна ломать генерацию ответа
+                    logger.warning(f"Failed to apply agent_response PHS shift: {e}")
 
     except Exception as e:
         logger.error(f"Failed to save response to DB: {e}", exc_info=True)
