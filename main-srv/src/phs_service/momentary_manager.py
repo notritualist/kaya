@@ -25,7 +25,7 @@ Architecture:
 - Integrates with BaselineManager for sedimentation and state classification.
 """
 
-version = "1.1.1"
+version = "1.1.2"
 description = "Momentary hormonal state manager"
 
 import logging
@@ -366,36 +366,7 @@ class MomentaryManager:
             logger.warning(f"Closed {count} dangling momentary records on startup.")
         return count
 
-    def deactivate_for_actor(self, actor_id: str) -> int:
-        """
-        Деактивирует активный momentary для актора.
-        
-        Устанавливает is_active = false для текущей записи momentary.
-        Вызывается при штатном завершении сессии или shutdown.
-        
-        Args:
-            actor_id: UUID пользователя.
-            
-        Returns:
-            int: Количество деактивированных записей (0 или 1).
-        """
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE state.momentary
-                    SET is_active = FALSE
-                    WHERE actor_id = %s AND is_active = TRUE
-                    """,
-                    (actor_id,)
-                )
-                count = cur.rowcount
-                conn.commit()
-        
-        if count > 0:
-            logger.debug(f"Deactivated momentary for actor={actor_id[:8]}")
-        return count
-
+    
     def _insert_baseline_with_state(
         self,
         cortisol: float,

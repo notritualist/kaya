@@ -26,7 +26,7 @@ Dependencies:
 DB schema: migration V003
 Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.2.1"
+version = "1.2.2"
 description = "Global agent lifecycle manager"
 
 import logging
@@ -355,8 +355,8 @@ class LifecycleManager:
         Обрабатывает штатное выключение агента.
     
         Выполняет:
-        1. Осаждение momentary в baseline с коэффициентом alpha_session_end.
-        2. Деактивацию momentary (is_active = false).
+        1. Осаждение всех активных momentary в baseline с коэффициентом alpha_session_end.
+        2. Массовую деактивацию всех momentary (is_active = false).
         3. Закрытие lifecycle и переход в off.
     
         Args:
@@ -368,16 +368,34 @@ class LifecycleManager:
         from phs_service.momentary_manager import MomentaryManager
         momentary_mgr = MomentaryManager(self.db_config)
 
-        # === 1. Осаждение momentary в baseline ===
-        alpha = self._get_setting_float("alpha_session_end", default=0.2)
-        momentary_mgr.sediment_momentary_to_baseline(
-            actor_id=actor_id, alpha=alpha, reason_code="session_end_sedimentation"
-        )
+        # === 1. Получаем список всех активных actor_id ===
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT actor_id FROM state.momentary WHERE is_active = TRUE")
+                active_actors = [str(row[0]) for row in cur.fetchall()]  # ← Исправлено
+        
+        if active_actors:
+            # === 2. Осаждение опыта всех пользователей ===
+            alpha = self._get_setting_float("alpha_session_end", default=0.2)
+            for aid in active_actors:
+                momentary_mgr.sediment_momentary_to_baseline(
+                    actor_id=aid, alpha=alpha, reason_code="session_end_sedimentation"
+                )
 
-        # === 2. Деактивация momentary ===
-        # Сбрасываем is_active, чтобы при следующем запуске не было warning о dangling
-        momentary_mgr.deactivate_for_actor(actor_id)
+            # === 3. Массовая деактивация всех обработанных записей ===
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE state.momentary
+                        SET is_active = FALSE
+                        WHERE actor_id = ANY(%s::uuid[])
+                    """, (active_actors,))
+                    conn.commit()
+            logger.info(f"Sedimented and deactivated {len(active_actors)} active momentaries.")
+        else:
+            logger.info("No active momentaries to sediment.")
 
+        # === 4. Закрытие lifecycle ===
         shutdown_type = self._prompt_shutdown_reason()
         shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
 
