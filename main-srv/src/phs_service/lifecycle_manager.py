@@ -9,7 +9,7 @@ Principles:
     - The orchestrator is the source of truth for timeout-driven transitions.
     - PHS logic (baseline drift during shutdown/crash) is fully preserved.
     - handle_startup guarantees closing ANY dangling record (active/sleep/off).
-
+  
 Responsibilities:
     - Start and stop lifecycle states
     - Handle graceful startup and crash recovery
@@ -17,6 +17,7 @@ Responsibilities:
     - Apply offline drift to baseline during downtime
     - Sediment dangling momentary states on crash
     - Wake up from sleep
+    - Apply global baseline shifts on sleep and wake up (inactivity_sleep / wake_up)
 
 Dependencies:
     - BaselineManager (drift, sedimentation)
@@ -26,7 +27,7 @@ Dependencies:
 DB schema: migration V003
 Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.2.3"
+version = "1.3.0"
 description = "Global agent lifecycle manager"
 
 import logging
@@ -206,6 +207,25 @@ class LifecycleManager:
     # =========================================================================
 
     def record_activity(self, actor_id: str, reason: str = 'user_activity') -> None:
+        """Регистрирует активность агента, обновляя временную метку active-состояния
+        или пробуждая из сна с применением сдвига baseline.
+
+        Логика:
+        - Если активного жизненного цикла нет → создаётся новый active.
+        - Если текущее состояние sleep:
+            * Определяется причина пробуждения (user_wake_up / agent_wake_up).
+            * Применяется глобальный сдвиг baseline (wake_up).
+            * Закрывается текущий sleep-цикл.
+            * Запускается новый active-цикл.
+        - Если состояние active → обновляется только updated_at.
+
+        Args:
+            actor_id: Идентификатор инициатора (например, 'user' или 'orchestrator').
+            reason: Причина активности ('user_activity' или 'agent_activity').
+
+        Returns:
+            None
+        """
         current = self._get_global_lifecycle()
         if not current:
             self._start_new_lifecycle(actor_id, reason, 'active')
@@ -213,6 +233,14 @@ class LifecycleManager:
 
         if current['state_type'] == 'sleep':
             wake_reason = 'user_wake_up' if reason == 'user_activity' else 'agent_wake_up'
+            
+            # Применяем глобальный сдвиг baseline (пробуждение)
+            from phs_service.baseline_manager import BaselineManager
+            baseline_mgr = BaselineManager(self.db_config)
+            shift_result = baseline_mgr.apply_event_shift('wake_up')
+            if shift_result.get("applied"):
+                logger.info(f"Baseline shifted due to wake_up: {shift_result['baseline_id_before'][:8]} -> {shift_result['baseline_id_after'][:8]}")
+                
             self._close_global_lifecycle(wake_reason)
             self._start_new_lifecycle(actor_id, wake_reason, 'active')
         else:
@@ -261,63 +289,21 @@ class LifecycleManager:
             f"Transitioning active → sleep."
         )
 
-        # === 2. Создаём momentary срез с event_type_id = inactivity_sleep ===
+        # Получаем actor_id из текущей записи lifecycle (исправление Pylance)
         actor_id = current.get('actor_id')
-        
-        # Pylance fix: actor_id может быть None по типу dict, но в БД он NOT NULL
-        if actor_id is not None:
-            actor_id_str = str(actor_id)
-            
-            momentary_mgr = MomentaryManager(self.db_config)
+        actor_id_str = str(actor_id) if actor_id else "00000000-0000-0000-0000-000000000000"
 
-            # Получаем event_type_id для inactivity_sleep
-            with psycopg2.connect(**self.db_config) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id FROM state.delta_reasons WHERE event_type_code = %s",
-                        ("inactivity_sleep",)
-                    )
-                    row = cur.fetchone()
-                    event_type_id = str(row[0]) if row else None
+        # === 2. Применяем глобальный сдвиг baseline (засыпание) ===
+        from phs_service.baseline_manager import BaselineManager
+        baseline_mgr = BaselineManager(self.db_config)
+        shift_result = baseline_mgr.apply_event_shift('inactivity_sleep')
+        if shift_result.get("applied"):
+            logger.info(f"Baseline shifted due to inactivity_sleep: {shift_result['baseline_id_before'][:8]} -> {shift_result['baseline_id_after'][:8]}")
 
-            if event_type_id:
-                # Получаем активную сессию для actor_id
-                with psycopg2.connect(**self.db_config) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            SELECT id FROM dialogs.sessions
-                            WHERE actor_id = %s AND closed_at IS NULL
-                            ORDER BY created_at DESC LIMIT 1
-                            """,
-                            (actor_id_str,)
-                        )
-                        session_row = cur.fetchone()
-                        session_id = str(session_row[0]) if session_row else None
-
-                if session_id:
-                    # Создаём новый momentary срез с event_payload
-                    baseline = momentary_mgr.baseline_mgr.get_current_baseline()
-                    if baseline:
-                        momentary_mgr._create_momentary_record(
-                            session_id=session_id,
-                            actor_id=actor_id_str,
-                            baseline_id=str(baseline["id"]),
-                            cort=baseline["cortisol"],
-                            dopa=baseline["dopamine"],
-                            oxy=baseline["oxytocin"],
-                            valence=baseline["valence"],
-                            vector=baseline["state_vector"],
-                            event_type_id=event_type_id
-                        )
-                        logger.info(
-                            f"Created momentary slice with event_type=inactivity_sleep "
-                            f"for actor={actor_id_str[:8]}"
-                        )
-
-            # === 3. Переводим lifecycle в sleep ===
-            self._close_global_lifecycle('inactivity_timeout')
-            self._start_new_lifecycle(actor_id_str, 'inactivity_timeout', 'sleep')
+        # === 3. Переводим lifecycle в sleep ===
+        self._close_global_lifecycle('inactivity_timeout')
+        self._start_new_lifecycle(actor_id_str, 'inactivity_timeout', 'sleep')
+       
 
     # =========================================================================
     # PHS: STARTUP / SHUTDOWN

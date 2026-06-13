@@ -12,6 +12,8 @@ Functions:
 - Automatic state classification: computes state_id via RFF vector cosine similarity to self_knowledge prototypes.
 - Handles offline drift on startup based on shutdown_type and downtime duration.
 - Full traceability: all operations return baseline_id_before and baseline_id_after in output_data.
+- Global event shifts (wake_up, inactivity_sleep): reads shift values from state.settings,
+  applies them to active baseline respecting boundaries, creates new baseline record.
 
 Architecture:
 - Single active baseline record at any time (enforced by is_active flag).
@@ -19,7 +21,7 @@ Architecture:
 - Integrates with MomentaryManager for hourly sedimentation of momentary experience.
 """
 
-version = "1.2.1"
+version = "1.3.0"
 description = "Hormonal Background (Baseline) Manager"
 
 import logging
@@ -377,6 +379,70 @@ class BaselineManager:
         "applied": True,
         "baseline_id_before": before_id,
         "baseline_id_after": after_id
+        }
+    
+    def apply_event_shift(self, event_code: str, step_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Применяет глобальный событийный сдвиг к baseline (например, wake_up, inactivity_sleep).
+        Значения сдвигов читаются из state.settings (value_json).
+
+        Args:
+            event_code: Код события ('wake_up' или 'inactivity_sleep').
+            step_id: UUID шага оркестратора (опционально).
+
+        Returns:
+            dict: Результат с baseline_id_before и baseline_id_after.
+        """
+        setting_name = f"baseline_shift_{event_code}"
+        
+        # 1. Читаем JSON сдвиги из настроек
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value_json FROM state.settings WHERE param_name = %s",
+                    (setting_name,)
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    logger.warning(f"No shift settings found for {setting_name}, skipping.")
+                    return {"applied": False, "reason": f"missing_setting_{setting_name}"}
+                shifts = row[0]
+
+        current = self.get_current_baseline()
+        if not current:
+            return {"applied": False, "error": "no_baseline"}
+
+        before_id = str(current["id"])
+        
+        # 2. Применяем сдвиги с учетом физиологических границ
+        new_hormones = {}
+        for h in ["cortisol", "dopamine", "oxytocin"]:
+            shift_val = float(shifts.get(h, 0.0))
+            min_val = self.mins[f"min_{h}"]
+            h_new = current[h] + shift_val
+            new_hormones[h] = max(min_val, min(100.0, h_new))
+            
+        logger.info(
+            f"Applying global event shift '{event_code}': "
+            f"Cortisol {current['cortisol']:.1f} -> {new_hormones['cortisol']:.1f}, "
+            f"Dopamine {current['dopamine']:.1f} -> {new_hormones['dopamine']:.1f}, "
+            f"Oxytocin {current['oxytocin']:.1f} -> {new_hormones['oxytocin']:.1f}"
+        )
+
+        # 3. Пересчет валентности, вектора и классификация
+        valence = compute_valence(**new_hormones)
+        vector = self.encoder.encode(**new_hormones, valence=valence)
+        
+        after_id = self._insert_baseline(
+            new_hormones["cortisol"], new_hormones["dopamine"], new_hormones["oxytocin"],
+            valence, vector, event_code, step_id=step_id
+        )
+        
+        return {
+            "applied": True,
+            "baseline_id_before": before_id,
+            "baseline_id_after": after_id,
+            "event_code": event_code
         }
 
     def _insert_baseline(

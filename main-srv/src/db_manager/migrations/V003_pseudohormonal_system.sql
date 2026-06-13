@@ -133,9 +133,11 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     Малое значение, чтобы не мешать OU-дрейфу к уставкам.'),
     ('alpha_session_end', 0.2, NULL, NULL, 'Коэффициент осаждения momentary в baseline при завершении сессии. Умеренный вклад опыта сессии.'),
     ('alpha_crash_recovery', 0.1, NULL, NULL, 'Коэффициент осаждения momentary в baseline при восстановлении после креша. Осторожное обновление.'),
-
+    -- Параметры влияния гормонов при событиях (единицы)
+    ('baseline_shift_wake_up', NULL, NULL, '{"cortisol": 20.0, "dopamine": 10.0, "oxytocin": 5.0}'::jsonb, 'Сдвиг baseline при пробуждении (выход из inactivity_sleep_minutes)'),
+    ('baseline_shift_inactivity_sleep', NULL, NULL, '{"cortisol": -20.0, "dopamine": -10.0, "oxytocin": -5.0}'::jsonb, 'Сдвиг baseline при засыпании (переход по inactivity_sleep_minutes)'),
     -- Порог бездействия для перехода в sleep (минуты)
-    ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователя, после которых агент переходит из active в sleep.'),
+    ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователей, после которых агент переходит из active в sleep.'),
     ('dialogue_inactivity_timeout_minutes', 20.0, NULL, NULL, 'Таймаут неактивности диалога в минутах для пользователя. Если last_activity_at старше порога, 
     диалог закрывается и создаётся новый.'),
     -- Параметры RFF (Random Fourier Features)
@@ -190,7 +192,9 @@ INSERT INTO state.baseline_change_reasons (id, reason_code, description) VALUES
     (gen_random_uuid(), 'shutdown_agent_modification', 'Изменение состояния после доработки и тестирования агента'),
     (gen_random_uuid(), 'hourly_sedimentation', 'Ежечасное осаждение momentary в baseline'),
     (gen_random_uuid(), 'session_end_sedimentation', 'Осаждение momentary в baseline при завершении сессии'),
-    (gen_random_uuid(), 'crash_sedimentation', 'Осаждение momentary в baseline при восстановлении после креша')
+    (gen_random_uuid(), 'crash_sedimentation', 'Осаждение momentary в baseline при восстановлении после креша'),
+    (gen_random_uuid(), 'inactivity_sleep', 'Глобальное засыпание агента без диалогов с пользователями (снижение кортизола и дофамина)'),
+    (gen_random_uuid(), 'wake_up', 'Глобальное пробуждение агента от диалогов с пользователями (кортизоловая реакция пробуждения)')
 ON CONFLICT (reason_code) DO NOTHING;
 
 -- =============================================
@@ -232,10 +236,8 @@ INSERT INTO state.delta_reasons (id, event_type_code, description, prompt_descri
     (gen_random_uuid(), 'agent_start', 'Включение агента', 'Я начала работу, физически запущена как система. Моё эмоциональное состояние восстановлено из долговременной памяти.'),
     (gen_random_uuid(), 'agent_stop', 'Выключение агента', 'Произошло физическое завершение работы меня как системы. Отключение и сохранение текущего 
     эмоционального состояния в долговременной памяти.'),
-    (gen_random_uuid(), 'wake_up', 'Пробуждение после сна', 'Произошло возобновление моей активности по взаимодействию с собеседниками которую я инициировала.'),
-    (gen_random_uuid(), 'inactivity_sleep', 'Переход в сон', 'Произошел переход меня в режим своих задач, из-за отсутствия взаимодействия с собеседниками'),
     (gen_random_uuid(), 'dialogue_timeout', 'Таймаут диалога', 'Мой диалог с собеседником был завершен из-за его неактивности или длительного отсутствия.'),
-    (gen_random_uuid(), 'user_activity', 'Возобновление активности', 'Произошло возобновление моей активности с собеседником, которую он инициировал.')
+    (gen_random_uuid(), 'user_activity', 'Возобновление активности', 'Произошло возобновление моей активности с собеседником, которую инициировал он диалогом.')
 ON CONFLICT (event_type_code) DO NOTHING;
 
 -- =============================================
