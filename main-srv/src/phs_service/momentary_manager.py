@@ -10,12 +10,13 @@ Features:
     • session_end: on graceful shutdown (alpha = alpha_session_end from settings)
     • hourly: during phs_baseline_drift task (alpha = alpha_hourly_drift from settings)
     • crash: on startup after unclean shutdown (alpha = alpha_crash_recovery from settings)
-- Handles decay via orchestrator task phs_momentary_decay:
-    Formula: new = baseline + (momentary - baseline) * (1 - alpha_momentary_decay * exp(-dt/tau_hormone)) + noise.
+- Handles decay via orchestrator task phs_momentary_decay.
+- Decay formula: new = baseline + (momentary - baseline) * (1 - alpha * exp(-dt/tau_hormone)) + noise.
     Each hormone decays at its own biological rate (tau_cortisol=3600s, tau_dopamine=180s, tau_oxytocin=600s).
 - Manages dangling momentary cleanup on startup/crash recovery (deactivates orphaned records).
 - All changes create NEW rows (immutable history), old rows deactivated via is_active=FALSE.
 - Full traceability: output_data contains IDs before/after for all operations (momentary_id_before/after, baseline_id).
+- Auto-populates event_payload with human-readable prompt_description from delta_reasons for LLM self-awareness.
 
 Architecture:
 - One active momentary slice per actor at any time (enforced by is_active flag).
@@ -23,15 +24,16 @@ Architecture:
     • Decay: momentary → baseline (continuous, every 60s)
     • Sedimentation: momentary → baseline (discrete events: session end/hourly/crash)
 - Integrates with BaselineManager for sedimentation and state classification.
+- event_payload is freely writable: can contain prompt_description or custom code-generated text.
 """
 
-version = "1.1.2"
+version = "1.2.0"
 description = "Momentary hormonal state manager"
 
 import logging
 import psycopg2
 import random
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from typing import Dict, Any, Optional
 
 from phs_service.state_classifier import StateClassifier
@@ -115,6 +117,49 @@ class MomentaryManager:
                     return default
                 return float(row[0])
     
+    
+    def _get_event_payload(
+        self,
+        event_type_id: Optional[str],
+        custom_payload: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Формирует event_payload для записи momentary.
+
+        Логика:
+        1. Если передан custom_payload — возвращается он (приоритет).
+        2. Иначе читает prompt_description из state.delta_reasons по event_type_id.
+        3. Если описание найдено — возвращает {"prompt_description": ...}.
+        4. Иначе возвращает None (event_payload останется NULL в БД).
+
+        Args:
+            event_type_id: UUID типа события из state.delta_reasons.
+            custom_payload: Пользовательский payload (например, от кода генерации).
+
+        Returns:
+            dict | None: Словарь для записи в event_payload или None.
+        """
+        # Приоритет у custom_payload (например, сгенерированный кодом текст)
+        if custom_payload is not None:
+            return custom_payload
+
+        # Если event_type_id не задан — payload не нужен
+        if event_type_id is None:
+            return None
+
+        # Читаем prompt_description из delta_reasons
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT prompt_description FROM state.delta_reasons WHERE id = %s",
+                    (event_type_id,)
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return {"prompt_description": row[0]}
+
+        return None
+    
     def create_momentary_from_baseline(
         self,
         session_id: str,
@@ -179,21 +224,25 @@ class MomentaryManager:
                     ("agent_start",)
                 )
                 row = cur.fetchone()
-                event_type_id = row[0] if row else None
+                event_type_id = str(row[0]) if row else None
                 dialog_id = self._get_active_dialogue_id(actor_id)
+
+                # Формируем event_payload из prompt_description
+                event_payload = self._get_event_payload(event_type_id)
 
                 # Вставляем новый momentary
                 cur.execute("""
                     INSERT INTO state.momentary (
                         session_id, baseline_id, actor_id, dialog_id,
                         cortisol, dopamine, oxytocin, valence, state_vector,
-                        state_id, event_type_id, is_active, agent_version
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                        state_id, event_type_id, event_payload, is_active, agent_version
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
                     RETURNING id
                 """, (
-                    session_id, baseline_id, actor_id, dialog_id,  # ← dialog_id добавлен
+                    session_id, baseline_id, actor_id, dialog_id,
                     cort, dopa, oxy, valence, vector,
-                    state_id, event_type_id, self.agent_version
+                    state_id, event_type_id, Json(event_payload) if event_payload else None,
+                    self.agent_version
                 ))
                 momentary_id = str(cur.fetchone()[0])
                 
@@ -446,6 +495,7 @@ class MomentaryManager:
             logger.exception("Momentary decay task failed")
             complete_task_error(task_id, "phs_service", str(e))
             raise
+    
 
     def apply_decay_tick(self, step_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -569,19 +619,24 @@ class MomentaryManager:
                     # Автозаполнение dialog_id (если есть активный диалог)
                     dialog_id = self._get_active_dialogue_id(m['actor_id'])
                     
+                    # Формируем event_payload из prompt_description
+                    event_payload = self._get_event_payload(event_type_id)
+
                     # Вставляем новую запись
                     cur.execute("""
                         INSERT INTO state.momentary (
                             session_id, baseline_id, actor_id, dialog_id,
                             cortisol, dopamine, oxytocin, valence, state_vector,
-                            state_id, event_type_id, is_active, agent_version,
+                            state_id, event_type_id, event_payload, is_active, agent_version,
                             orchestrator_step_id, recorded_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, NOW())
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, NOW())
                         RETURNING id
                     """, (
                         m['session_id'], m['baseline_id'], m['actor_id'], dialog_id,
                         new_cort, new_dopa, new_oxy, new_valence, new_vector,
-                        state_match.state_id, event_type_id, self.agent_version,
+                        state_match.state_id, event_type_id,
+                        Json(event_payload) if event_payload else None,
+                        self.agent_version,
                         step_id
                     ))
                     new_id = str(cur.fetchone()[0])
@@ -605,3 +660,72 @@ class MomentaryManager:
             "tau_oxytocin": tau_oxy,
             "dt": dt
         }
+    
+
+    def _create_momentary_record(
+        self,
+        session_id: str,
+        actor_id: str,
+        baseline_id: str,
+        cort: float,
+        dopa: float,
+        oxy: float,
+        valence: float,
+        vector: list,
+        event_type_id: Optional[str]
+    ) -> str:
+        """
+        Вспомогательный метод: создаёт запись momentary с автозаполнением event_payload.
+
+        Используется lifecycle_manager при переходах состояний (wake_up, inactivity_sleep).
+
+        Args:
+            session_id: UUID физической сессии.
+            actor_id: UUID пользователя.
+            baseline_id: UUID baseline.
+            cort, dopa, oxy: Уровни гормонов.
+            valence: Валентность.
+            vector: RFF-вектор.
+            state_id: UUID классифицированного состояния.
+            event_type_id: UUID типа события из delta_reasons.
+
+        Returns:
+            str: UUID созданной записи momentary.
+        """
+        state_match = self.classifier.classify_vector(vector)
+        state_id = state_match.state_id
+
+        dialog_id = self._get_active_dialogue_id(actor_id)
+        event_payload = self._get_event_payload(event_type_id)
+
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                # Деактивируем предыдущий momentary для этого актора
+                cur.execute(
+                    """
+                    UPDATE state.momentary
+                    SET is_active = FALSE
+                    WHERE actor_id = %s AND is_active = TRUE
+                    """,
+                    (actor_id,)
+                )
+
+                # Вставляем новую запись
+                cur.execute("""
+                    INSERT INTO state.momentary (
+                        session_id, baseline_id, actor_id, dialog_id,
+                        cortisol, dopamine, oxytocin, valence, state_vector,
+                        state_id, event_type_id, event_payload, is_active, agent_version
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                    RETURNING id
+                """, (
+                    session_id, baseline_id, actor_id, dialog_id,
+                    cort, dopa, oxy, valence, vector,
+                    state_id, event_type_id,
+                    Json(event_payload) if event_payload else None,
+                    self.agent_version
+                ))
+                momentary_id = str(cur.fetchone()[0])
+                conn.commit()
+
+        return momentary_id

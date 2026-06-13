@@ -26,7 +26,7 @@ Dependencies:
 DB schema: migration V003
 Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.2.2"
+version = "1.2.3"
 description = "Global agent lifecycle manager"
 
 import logging
@@ -115,9 +115,21 @@ class LifecycleManager:
         """
         Создаёт новую запись глобального состояния.
         shutdown_id допустим только для state_type='off'.
+        
+        Защита: перед созданием новой записи принудительно закрывает ВСЕ
+        зависшие записи (ended_at IS NULL), чтобы избежать UniqueViolation
+        из-за прошлых багов или гонок.
         """
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
+                # === БРОНЯ: Закрываем все возможные висяки ===
+                cur.execute("""
+                    UPDATE state.agent_lifecycle
+                    SET ended_at = NOW(), updated_at = NOW()
+                    WHERE ended_at IS NULL
+                """)
+                
+                # === Создаём новую запись ===
                 cur.execute("""
                     INSERT INTO state.agent_lifecycle (
                         actor_id, state_type, reason_change, shutdown_reason_id, agent_version
@@ -126,6 +138,7 @@ class LifecycleManager:
                     )
                 """, (actor_id, state_type, reason, shutdown_id, agent_version))
                 conn.commit()
+                
         logger.info(
             f"Started new global lifecycle: {state_type} ({reason}), "
             f"initiated by actor {actor_id[:8]}"
@@ -214,25 +227,97 @@ class LifecycleManager:
             logger.debug(f"Activity recorded by {actor_id[:8]}, state remains active")
 
     def check_inactivity(self) -> None:
+        """
+        Проверяет бездействие и переводит агента в sleep при необходимости.
+
+        Логика:
+        1. Если агент в состоянии active и время бездействия > inactivity_sleep_minutes:
+           - Создаёт моментary срез с event_type_id = inactivity_sleep
+           - Переводит lifecycle в sleep
+        2. Иначе — ничего не делает.
+
+        Вызывается оркестратором в главном цикле (~1 сек).
+        """
         current = self._get_global_lifecycle()
         if not current or current['state_type'] != 'active':
             return
 
+        # === 1. Проверяем время бездействия ===
         now = datetime.now(timezone.utc)
         last_activity = current['updated_at']
+        
+        # Защита от naive datetime (на случай если БД вернула без timezone)
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
-
+        
         elapsed_sec = (now - last_activity).total_seconds()
         threshold_sec = self._get_inactivity_sleep_minutes() * 60
 
-        if elapsed_sec > threshold_sec:
-            logger.info(
-                f"Inactivity timeout: {elapsed_sec:.1f}s > {threshold_sec:.0f}s. "
-                f"Transitioning active → sleep"
-            )
+        if elapsed_sec <= threshold_sec:
+            return
+
+        logger.info(
+            f"Inactivity timeout: {elapsed_sec:.1f}s > {threshold_sec:.0f}s. "
+            f"Transitioning active → sleep."
+        )
+
+        # === 2. Создаём momentary срез с event_type_id = inactivity_sleep ===
+        actor_id = current.get('actor_id')
+        
+        # Pylance fix: actor_id может быть None по типу dict, но в БД он NOT NULL
+        if actor_id is not None:
+            actor_id_str = str(actor_id)
+            
+            momentary_mgr = MomentaryManager(self.db_config)
+
+            # Получаем event_type_id для inactivity_sleep
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM state.delta_reasons WHERE event_type_code = %s",
+                        ("inactivity_sleep",)
+                    )
+                    row = cur.fetchone()
+                    event_type_id = str(row[0]) if row else None
+
+            if event_type_id:
+                # Получаем активную сессию для actor_id
+                with psycopg2.connect(**self.db_config) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id FROM dialogs.sessions
+                            WHERE actor_id = %s AND closed_at IS NULL
+                            ORDER BY created_at DESC LIMIT 1
+                            """,
+                            (actor_id_str,)
+                        )
+                        session_row = cur.fetchone()
+                        session_id = str(session_row[0]) if session_row else None
+
+                if session_id:
+                    # Создаём новый momentary срез с event_payload
+                    baseline = momentary_mgr.baseline_mgr.get_current_baseline()
+                    if baseline:
+                        momentary_mgr._create_momentary_record(
+                            session_id=session_id,
+                            actor_id=actor_id_str,
+                            baseline_id=str(baseline["id"]),
+                            cort=baseline["cortisol"],
+                            dopa=baseline["dopamine"],
+                            oxy=baseline["oxytocin"],
+                            valence=baseline["valence"],
+                            vector=baseline["state_vector"],
+                            event_type_id=event_type_id
+                        )
+                        logger.info(
+                            f"Created momentary slice with event_type=inactivity_sleep "
+                            f"for actor={actor_id_str[:8]}"
+                        )
+
+            # === 3. Переводим lifecycle в sleep ===
             self._close_global_lifecycle('inactivity_timeout')
-            self._start_new_lifecycle(current['actor_id'], 'inactivity_timeout', 'sleep')
+            self._start_new_lifecycle(actor_id_str, 'inactivity_timeout', 'sleep')
 
     # =========================================================================
     # PHS: STARTUP / SHUTDOWN

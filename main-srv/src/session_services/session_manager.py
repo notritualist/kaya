@@ -4,26 +4,26 @@ main-srv/src/session_services/session_manager.py
 Session and dialog manager for agent interfaces.
 
 Responsible for:
-- Binding users (console:) to actors (owner/user)
-- Creating a physical connection session (dialogs.sessions) with PHS integration
+- Binding users (console:) to actors (owner/user) via users.actors_external_ids.
+- Creating physical connection sessions (dialogs.sessions).
 - Managing the dialog lifecycle via dialog_services.dialogue_manager:
-    * Lazy dialog creation on first message
-    * Automatic inactivity timeout check
-    * Manual dialog termination (Ctrl+N / rotate_dialogue)
-- Saving messages in dialogs.row_messages with a binding to dialog_id
-- Correctly ending dialogs and sessions on exit
-- Cleaning up frozen sessions and dialogs when restarting the agent
+    * Lazy dialog creation on first message (ensure_active_dialogue).
+    * Automatic inactivity timeout check.
+    * Manual dialog termination (Ctrl+N / rotate_dialogue).
+- Saving messages in dialogs.row_messages with mandatory dialogue_id binding.
+- Correctly ending dialogs and sessions on exit.
+- Cleaning up frozen sessions and dialogs when restarting the agent.
 
 PHS Integration:
-- Each new session automatically creates a momentary state snapshot
-- Snapshot links to current baseline and actor context
+- Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
+- SessionManager does NOT perform PHS calculations or DB writes to state.momentary directly.
+- Snapshot links to current baseline and actor context are handled by MomentaryManager.
 
-DB schema: migration V002, V003
 Tables: users.actors, users.actors_external_ids, dialogs.sessions, 
         dialogs.dialogues, dialogs.row_messages, state.momentary
 """
 
-version = "1.2.1"
+version = "1.2.2"
 description = "Session and dialog manager for the agent console interface"
 
 import logging
@@ -293,15 +293,9 @@ class SessionManager:
         Создаёт новую физическую сессию и моментальный гормональный срез в одной транзакции.
         
         Логика:
-        1. BEGIN
-        2. Читаем актуальный baseline (гормоны, вектор, id).
-        3. Вставляем dialogs.sessions.
-        4. Вставляем state.momentary с session_id, baseline_id, state_id.
-        5. Обновляем dialogs.sessions с baseline_id, state_id.
-        6. COMMIT
-        
-        Гарантирует атомарность и согласованность состояния.
-        Исключает создание momentary из устаревшего baseline.
+        1. Читаем closed_at последней сессии для sleep_duration.
+        2. Вставляем dialogs.sessions.
+        3. Делегируем создание momentary в MomentaryManager.create_momentary_from_baseline().
         
         Returns:
             str: UUID новой сессии.
@@ -334,33 +328,7 @@ class SessionManager:
         conn = self._get_conn()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # === BEGIN ===
-                # cursor context manager doesn't auto-commit, we control it
-                
-                # 1. Читаем актуальный baseline
-                cur.execute("""
-                    SELECT id, cortisol, dopamine, oxytocin, valence, state_vector
-                    FROM state.baseline_phs WHERE is_active = TRUE LIMIT 1
-                """)
-                baseline = cur.fetchone()
-                if not baseline:
-                    raise RuntimeError("Cannot create session: no active baseline found. Ensure baseline is initialized.")
-                
-                baseline_id = str(baseline['id'])
-                cort = baseline['cortisol']
-                dopa = baseline['dopamine']
-                oxy = baseline['oxytocin']
-                valence = baseline['valence']
-                vector = baseline['state_vector']
-                
-                # 2. Классифицируем состояние для state_id
-                # Импортируем здесь, чтобы избежать циклических импортов
-                from phs_service.state_classifier import StateClassifier
-                classifier = StateClassifier(self.db_config)
-                state_match = classifier.classify_vector(vector)
-                state_id = state_match.state_id
-                
-                # 3. Вставляем сессию
+                # 1. Вставляем сессию
                 cur.execute(f"""
                     INSERT INTO dialogs.sessions (
                         actor_id, actor_external_id, status, agent_version, sleep_duration
@@ -373,58 +341,28 @@ class SessionManager:
                     raise RuntimeError("Failed to create session in DB")
                 session_id = str(session_row['id'])
                 
-                # 4. Деактивируем предыдущий momentary для актора
-                cur.execute("""
-                    UPDATE state.momentary SET is_active = FALSE
-                    WHERE actor_id = %s AND is_active = TRUE
-                """, (self.actor_id,))
-                
-                # 5. Получаем event_type_id для agent_start
-                cur.execute("""
-                    SELECT id FROM state.delta_reasons WHERE event_type_code = %s
-                """, ("agent_start",))
-                event_row = cur.fetchone()
-                event_type_id = event_row['id'] if event_row else None
-                
-                # 6. Вставляем momentary
-                cur.execute("""
-                    INSERT INTO state.momentary (
-                        session_id, baseline_id, actor_id,
-                        cortisol, dopamine, oxytocin, valence, state_vector,
-                        state_id, event_type_id, is_active, agent_version
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s
-                    ) RETURNING id
-                """, (
-                    session_id, baseline_id, self.actor_id,
-                    cort, dopa, oxy, valence, vector,
-                    state_id, event_type_id, self.agent_version
-                ))
-                momentary_row = cur.fetchone()
-                momentary_id = str(momentary_row['id']) if momentary_row else None
-                
-                # 7. Обновляем сессию с baseline_id и state_id
-                cur.execute("""
-                    UPDATE dialogs.sessions
-                    SET baseline_id = %s, state_id = %s
-                    WHERE id = %s
-                """, (baseline_id, state_id, session_id))
-                
-                # === COMMIT ===
                 conn.commit()
                 
-                self.session_id = session_id
-                logger.info(
-                    f"Session created: {session_id[:8]}, momentary: {(momentary_id or 'N/A')[:8]}, "
-                    f"baseline: {baseline_id[:8]}, state: {state_match.state_code}"
-                )
-                return session_id
-                
+            self.session_id = session_id
+            
+            # 2. ДЕЛЕГИРУЕМ создание momentary в MomentaryManager
+            momentary_mgr = get_momentary_manager(self.db_config)
+            momentary_id = momentary_mgr.create_momentary_from_baseline(
+                session_id=session_id,
+                actor_id=self.actor_id
+            )
+            
+            logger.info(
+                f"Session created: {session_id[:8]}, momentary: {momentary_id[:8]}"
+            )
+            return session_id
+            
         except Exception as e:
             conn.rollback()
-            logger.error(f"Error creating session with momentary: {e}", exc_info=True)
+            self.session_id = None
+            logger.error(f"Error creating session: {e}", exc_info=True)
             raise
-    
+        
     def rotate_dialogue(self, reason: str = 'user_new_dialogue'):
         """
         Вручную завершает текущий активный диалог и сбрасывает кэш.

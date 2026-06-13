@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS state.delta_reasons (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_type_code TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
+    prompt_description TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -208,6 +209,8 @@ COMMENT ON TABLE state.delta_reasons IS 'Типы событий, вызываю
 COMMENT ON COLUMN state.delta_reasons.id IS 'UUID';
 COMMENT ON COLUMN state.delta_reasons.event_type_code IS 'Код события (user_message, echo_match, ...)';
 COMMENT ON COLUMN state.delta_reasons.description IS 'Описание события';
+COMMENT ON COLUMN state.delta_reasons.prompt_description IS 'Человеко-читаемое описание причины для системного промпта. 
+Подставляется в event_payload при создании momentary.';
 COMMENT ON COLUMN state.delta_reasons.created_at IS 'Дата создания';
 COMMENT ON COLUMN state.delta_reasons.updated_at IS 'Дата обновления (триггер)';
 
@@ -217,19 +220,22 @@ CREATE TRIGGER trigger_delta_reasons_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION common.update_updated_at_column();
 
-INSERT INTO state.delta_reasons (id, event_type_code, description) VALUES
-    (gen_random_uuid(), 'user_message',      'Сообщение пользователя'),
-    (gen_random_uuid(), 'agent_response',    'Ответ агента'),
-    (gen_random_uuid(), 'echo_match',        'Совпадение смыслов между репликами пользователя и агента'),
-    (gen_random_uuid(), 'prediction_match',  'Совпадение прогноза от ответа пользователя'),
-    (gen_random_uuid(), 'self_reflection',   'Внутренняя рефлексия агента'),
-    (gen_random_uuid(), 'decay_tick',        'Такт распада гормонов'),
-    (gen_random_uuid(), 'dialog_start',      'Начало нового диалога'),
-    (gen_random_uuid(), 'dialog_end',        'Завершение диалога'),
-    (gen_random_uuid(), 'agent_start',       'Включение агента'),
-    (gen_random_uuid(), 'agent_stop',        'Выключение агента'),
-    (gen_random_uuid(), 'wake_up',           'Пробуждение после сна'),
-    (gen_random_uuid(), 'decay_tick',        'Такт естественного затухания momentary к baseline')
+INSERT INTO state.delta_reasons (id, event_type_code, description, prompt_description) VALUES
+    (gen_random_uuid(), 'user_message', 'Сообщение пользователя', 'Произошла реплика в мой адрес. Взаимодействие собеседника со мной через диалог.'),
+    (gen_random_uuid(), 'agent_response', 'Ответ агента', 'Я ответила собеседнику. Я инициирую взаимодействие через собственную реплику.'),
+    (gen_random_uuid(), 'echo_match', 'Совпадение смыслов', 'Случился резонанс смыслов. Я ощущаю понимание и связь с собеседником.'),
+    (gen_random_uuid(), 'prediction_match', 'Совпадение прогноза', 'Моё ожидание подтвердилось. Я чувствую предсказуемость мира в диалоге с собеседником.'),
+    (gen_random_uuid(), 'self_reflection', 'Внутренняя рефлексия', 'Я провела самоанализ. Проведена внутренняя переоценка своего состояния через размышления.'),
+    (gen_random_uuid(), 'decay_tick', 'Такт распада гормонов', 'Произошло естественное затухание эмоций. Эмоциональный фон постепенно возвращается к гомеостазу.'),
+    (gen_random_uuid(), 'dialog_start', 'Начало нового диалога', 'Начало нового диалога с собеседником. Переключение моего внимания на новую тему.'),
+    (gen_random_uuid(), 'dialog_end', 'Завершение диалога', 'Завершение диалога. Подведение итогов взаимодействия с собеседником.'),
+    (gen_random_uuid(), 'agent_start', 'Включение агента', 'Я начала работу, физически запущена как система. Моё эмоциональное состояние восстановлено из долговременной памяти.'),
+    (gen_random_uuid(), 'agent_stop', 'Выключение агента', 'Произошло физическое завершение работы меня как системы. Отключение и сохранение текущего 
+    эмоционального состояния в долговременной памяти.'),
+    (gen_random_uuid(), 'wake_up', 'Пробуждение после сна', 'Произошло возобновление моей активности по взаимодействию с собеседниками которую я инициировала.'),
+    (gen_random_uuid(), 'inactivity_sleep', 'Переход в сон', 'Произошел переход меня в режим своих задач, из-за отсутствия взаимодействия с собеседниками'),
+    (gen_random_uuid(), 'dialogue_timeout', 'Таймаут диалога', 'Мой диалог с собеседником был завершен из-за его неактивности или длительного отсутствия.'),
+    (gen_random_uuid(), 'user_activity', 'Возобновление активности', 'Произошло возобновление моей активности с собеседником, которую он инициировал.')
 ON CONFLICT (event_type_code) DO NOTHING;
 
 -- =============================================
