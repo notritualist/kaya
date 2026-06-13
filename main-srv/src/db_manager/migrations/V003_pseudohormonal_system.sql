@@ -123,9 +123,12 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     Рекомендуемое значение: 0.4 — чуть выше, чем у baseline (0.3), так как momentary более лабилен и подвержен быстрым колебаниям.'),
     ('absence_max_effect_hours', 96.0, NULL, NULL, 'Время до депрессии при отсутствии пользователя в выключенном состоянии (например 96ч = 4 дня)'),
     -- Физиологические минимумы и параметры
-    ('min_cortisol', 5.0, NULL, NULL, 'Минимальный естественный уровень кортизола. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
-    ('min_dopamine', 10.0, NULL, NULL, 'Минимальный естественный уровень дофамина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
-    ('min_oxytocin', 10.0, NULL, NULL, 'Минимальный естественный уровень окситоцина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и momentary.'),
+    ('min_cortisol', 5.0, NULL, NULL, 'Минимальный естественный уровень кортизола. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и 
+    momentary.'),
+    ('min_dopamine', 10.0, NULL, NULL, 'Минимальный естественный уровень дофамина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline и 
+    momentary.'),
+    ('min_oxytocin', 10.0, NULL, NULL, 'Минимальный естественный уровень окситоцина. Дрейф не опускает ниже этого значения.  Ограничение применяется к baseline 
+    и momentary.'),
     -- Коэффициенты осаждения в baseline (α)
     ('alpha_momentary_decay', 0.05, NULL, NULL, 'Глобальный коэффициент затухания momentary к baseline за один тик. 
     Формула: new = baseline + (momentary - baseline) * (1 - alpha * decay_hormone) + noise. Значение 0.05 = 5% разницы закрывается за тик.'),
@@ -133,9 +136,19 @@ INSERT INTO state.settings (param_name, value_float, value_text, value_json, des
     Малое значение, чтобы не мешать OU-дрейфу к уставкам.'),
     ('alpha_session_end', 0.2, NULL, NULL, 'Коэффициент осаждения momentary в baseline при завершении сессии. Умеренный вклад опыта сессии.'),
     ('alpha_crash_recovery', 0.1, NULL, NULL, 'Коэффициент осаждения momentary в baseline при восстановлении после креша. Осторожное обновление.'),
-    -- Параметры влияния гормонов при событиях (единицы)
-    ('baseline_shift_wake_up', NULL, NULL, '{"cortisol": 20.0, "dopamine": 10.0, "oxytocin": 5.0}'::jsonb, 'Сдвиг baseline при пробуждении (выход из inactivity_sleep_minutes)'),
-    ('baseline_shift_inactivity_sleep', NULL, NULL, '{"cortisol": -20.0, "dopamine": -10.0, "oxytocin": -5.0}'::jsonb, 'Сдвиг baseline при засыпании (переход по inactivity_sleep_minutes)'),
+    -- Параметры влияния гормонов при событиях (в единицах)
+    ('baseline_shift_wake_up', NULL, NULL, '{"cortisol": 20.0, "dopamine": 10.0, "oxytocin": 5.0}'::jsonb, 'Сдвиг baseline при пробуждении (выход из 
+    inactivity_sleep_minutes)'),
+    ('baseline_shift_inactivity_sleep', NULL, NULL, '{"cortisol": -20.0, "dopamine": -10.0, "oxytocin": -5.0}'::jsonb, 'Сдвиг baseline при засыпании 
+    (переход по inactivity_sleep_minutes)'),
+    ('momentary_shift_dialog_start', NULL, NULL, '{"cortisol": 5.0, "dopamine": 10.0, "oxytocin": 2.0}'::jsonb, 'Сдвиг momentary при начале нового диалога 
+    (ориентировочный рефлекс, интерес)'),
+    ('momentary_shift_dialog_end', NULL, NULL, '{"cortisol": -3.0, "dopamine": -5.0, "oxytocin": 3.0}'::jsonb, 'Сдвиг momentary при штатном завершении диалога 
+    (расслабление, удовлетворение)'),
+    ('momentary_shift_dialogue_timeout', NULL, NULL, '{"cortisol": 8.0, "dopamine": -8.0, "oxytocin": -5.0}'::jsonb, 'Сдвиг momentary при таймауте диалога 
+    (фрустрация, чувство игнорирования)'),
+    ('momentary_shift_agent_stop', NULL, NULL, '{"cortisol": -5.0, "dopamine": -8.0, "oxytocin": 3.0}'::jsonb, 'Сдвиг momentary при штатном выключении агента 
+    (расслабление, тёплое прощание, закрепление связи)'),
     -- Порог бездействия для перехода в sleep (минуты)
     ('inactivity_sleep_minutes', 10.0, NULL, NULL, 'Число минут без сообщений пользователей, после которых агент переходит из active в sleep.'),
     ('dialogue_inactivity_timeout_minutes', 20.0, NULL, NULL, 'Таймаут неактивности диалога в минутах для пользователя. Если last_activity_at старше порога, 
@@ -231,13 +244,12 @@ INSERT INTO state.delta_reasons (id, event_type_code, description, prompt_descri
     (gen_random_uuid(), 'prediction_match', 'Совпадение прогноза', 'Моё ожидание подтвердилось. Я чувствую предсказуемость мира в диалоге с собеседником.'),
     (gen_random_uuid(), 'self_reflection', 'Внутренняя рефлексия', 'Я провела самоанализ. Проведена внутренняя переоценка своего состояния через размышления.'),
     (gen_random_uuid(), 'decay_tick', 'Такт распада гормонов', 'Произошло естественное затухание эмоций. Эмоциональный фон постепенно возвращается к гомеостазу.'),
-    (gen_random_uuid(), 'dialog_start', 'Начало нового диалога', 'Начало нового диалога с собеседником. Переключение моего внимания на новую тему.'),
+    (gen_random_uuid(), 'dialog_start', 'Начало нового диалога', 'Произошло возобновление моей активности с собеседником, которую инициировал он диалогом'),
     (gen_random_uuid(), 'dialog_end', 'Завершение диалога', 'Завершение диалога. Подведение итогов взаимодействия с собеседником.'),
     (gen_random_uuid(), 'agent_start', 'Включение агента', 'Я начала работу, физически запущена как система. Моё эмоциональное состояние восстановлено из долговременной памяти.'),
     (gen_random_uuid(), 'agent_stop', 'Выключение агента', 'Произошло физическое завершение работы меня как системы. Отключение и сохранение текущего 
     эмоционального состояния в долговременной памяти.'),
-    (gen_random_uuid(), 'dialogue_timeout', 'Таймаут диалога', 'Мой диалог с собеседником был завершен из-за его неактивности или длительного отсутствия.'),
-    (gen_random_uuid(), 'user_activity', 'Возобновление активности', 'Произошло возобновление моей активности с собеседником, которую инициировал он диалогом.')
+    (gen_random_uuid(), 'dialogue_timeout', 'Таймаут диалога', 'Мой диалог с собеседником был завершен из-за его неактивности или длительного отсутствия.')
 ON CONFLICT (event_type_code) DO NOTHING;
 
 -- =============================================

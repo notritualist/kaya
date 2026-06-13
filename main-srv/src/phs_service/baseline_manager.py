@@ -21,7 +21,7 @@ Architecture:
 - Integrates with MomentaryManager for hourly sedimentation of momentary experience.
 """
 
-version = "1.3.0"
+version = "1.3.1"
 description = "Hormonal Background (Baseline) Manager"
 
 import logging
@@ -383,13 +383,15 @@ class BaselineManager:
     
     def apply_event_shift(self, event_code: str, step_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Применяет глобальный событийный сдвиг к baseline (например, wake_up, inactivity_sleep).
-        Значения сдвигов читаются из state.settings (value_json).
-
+        АРХИТЕКТУРНОЕ ПРАВИЛО:
+        Сдвиги применяются ОТ УСТАВКИ (setpoint), а не от текущего значения!
+        Это создает стабильный циркадный якорь и предотвращает уход в минимума
+        при наложении дрейфа, sedimentation или crash-эффектов.
+        
         Args:
             event_code: Код события ('wake_up' или 'inactivity_sleep').
             step_id: UUID шага оркестратора (опционально).
-
+            
         Returns:
             dict: Результат с baseline_id_before и baseline_id_after.
         """
@@ -414,20 +416,23 @@ class BaselineManager:
 
         before_id = str(current["id"])
         
-        # 2. Применяем сдвиги с учетом физиологических границ
+        # 2. ПРИМЕНЯЕМ СДВИГИ ОТ SETPOINT (Циркадный якорь)
+        # Игнорируем current[h], берем self.setpoints[h]
         new_hormones = {}
         for h in ["cortisol", "dopamine", "oxytocin"]:
             shift_val = float(shifts.get(h, 0.0))
+            base_val = self.setpoints[h]  # ← КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
+            h_new = base_val + shift_val
             min_val = self.mins[f"min_{h}"]
-            h_new = current[h] + shift_val
             new_hormones[h] = max(min_val, min(100.0, h_new))
             
         logger.info(
-            f"Applying global event shift '{event_code}': "
-            f"Cortisol {current['cortisol']:.1f} -> {new_hormones['cortisol']:.1f}, "
-            f"Dopamine {current['dopamine']:.1f} -> {new_hormones['dopamine']:.1f}, "
-            f"Oxytocin {current['oxytocin']:.1f} -> {new_hormones['oxytocin']:.1f}"
+            f"Applying global event shift '{event_code}' FROM SETPOINT: "
+            f"Cortisol {self.setpoints['cortisol']:.1f} -> {new_hormones['cortisol']:.1f}, "
+            f"Dopamine {self.setpoints['dopamine']:.1f} -> {new_hormones['dopamine']:.1f}, "
+            f"Oxytocin {self.setpoints['oxytocin']:.1f} -> {new_hormones['oxytocin']:.1f}"
         )
+
 
         # 3. Пересчет валентности, вектора и классификация
         valence = compute_valence(**new_hormones)

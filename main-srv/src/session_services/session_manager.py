@@ -13,11 +13,14 @@ Responsible for:
 - Saving messages in dialogs.row_messages with mandatory dialogue_id binding.
 - Correctly ending dialogs and sessions on exit.
 - Cleaning up frozen sessions and dialogs when restarting the agent.
+- Updating session activity timestamp (update_activity).
+- Blocking wait for agent response via wait_for_agent_response.
 
 PHS Integration:
 - Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
 - SessionManager does NOT perform PHS calculations or DB writes to state.momentary directly.
 - Snapshot links to current baseline and actor context are handled by MomentaryManager.
+- Delegates momentary state snapshot creation to MomentaryManager via phs_cache.
 
 Tables: users.actors, users.actors_external_ids, dialogs.sessions, 
         dialogs.dialogues, dialogs.row_messages, state.momentary
@@ -80,7 +83,8 @@ class SessionManager:
         self._conn = None
             
         logger.debug(f"SessionManager created for {console_user_id}")
-        
+
+
     def _get_conn(self):
         """Возвращает активное соединение с БД, создавая при необходимости."""
         if self._conn is None or self._conn.closed:
@@ -92,6 +96,7 @@ class SessionManager:
                 logger.error(f"PostgreSQL connection error: {e}", exc_info=True)
                 raise
         return self._conn
+
 
     def _query(self, sql: str, params: Optional[tuple] = None, fetch: bool = False):
         """
@@ -122,7 +127,8 @@ class SessionManager:
                 exc_info=True
             )
             raise
-    
+
+
     def ensure_actor_linked(self) -> bool:
         """
         Привязывает текущего пользователя консоли к актору.
@@ -224,6 +230,7 @@ class SessionManager:
             logger.error(f"Error during actor binding:  {e}", exc_info=True)
             raise
 
+
     @staticmethod
     def close_dangling_sessions(db_config: dict) -> int:
         """
@@ -258,6 +265,7 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Error closing dangling sessions: {e}", exc_info=True)
             return 0        
+
 
     def _calculate_sleep_duration(self) -> Optional[str]:
         """
@@ -362,7 +370,8 @@ class SessionManager:
             self.session_id = None
             logger.error(f"Error creating session: {e}", exc_info=True)
             raise
-        
+
+
     def rotate_dialogue(self, reason: str = 'user_new_dialogue'):
         """
         Вручную завершает текущий активный диалог и сбрасывает кэш.
@@ -371,14 +380,24 @@ class SessionManager:
         
         Args:
             reason: причина закрытия (должна соответствовать dialog_close_reason ENUM)
+        Note:
+            Перед закрытием диалога применяется гормональный сдвиг 'dialog_end'.
+            После закрытия, если следующий вызов ensure_active_dialogue создаст новый диалог,
+            к нему будет применён сдвиг 'dialog_start'.
         """
         if not self.session_id or not self.actor_id:
             logger.warning("Cannot rotate dialogue: no active session/actor")
             return
             
         logger.info(f"Rotating dialogue. Reason: {reason}")
+        
+        # Применяем сдвиг завершения диалога (если есть активный momentary)
+        momentary_mgr = get_momentary_manager(self.db_config)
+        momentary_mgr.apply_dialogue_event_shift('dialog_end', self.actor_id)
+        
         close_active_dialogue(self.db_config, self.session_id, self.actor_id, reason)
         self.current_dialogue_id = None
+
 
     def save_message(self, content: str) -> str:
         """
@@ -497,6 +516,7 @@ class SessionManager:
             logger.error(f"Error saving message: {e}", exc_info=True)
             raise
 
+
     def update_activity(self):
         """Обновляет updated_at текущей сессии."""
         if not self.session_id:
@@ -511,12 +531,16 @@ class SessionManager:
             logger.error(f"Error updating activity: {e}", exc_info=True)
             raise
 
+
     def close_session(self, reason: str = "unknown"):
         """
         Завершает сессию и активный диалог: status='completed', closed_at=NOW(), reason=?.
         
         Args:
             reason: причина завершения (должна соответствовать ENUM session_close_reason в БД)
+        Note:
+            При завершении сессии, если есть активный диалог, 
+            перед его закрытием применяется гормональный сдвиг 'dialog_end'.
         """
         if not self.session_id:
             logger.debug("No active session to close")
@@ -524,8 +548,12 @@ class SessionManager:
         
         logger.info(f"Closing session {self.session_id[:8]} with reason: {reason}")
         try:
-            # V002: Перед закрытием сессии обязательно закрываем активный диалог
+            # Перед закрытием сессии обязательно закрываем активный диалог
             if self.actor_id:
+                # Применяем сдвиг momentary ПГС при завершении диалога перед закрытием
+                momentary_mgr = get_momentary_manager(self.db_config)
+                momentary_mgr.apply_dialogue_event_shift('dialog_end', self.actor_id)
+                
                 close_active_dialogue(self.db_config, self.session_id, self.actor_id, 'session_end')
 
             self._query("""
@@ -541,6 +569,7 @@ class SessionManager:
             logger.error(f"Error closing session: {e}", exc_info=True)
             raise
 
+
     def cleanup(self):
         """Закрывает соединение с БД."""
         if self._conn and not self._conn.closed:
@@ -553,9 +582,11 @@ class SessionManager:
                 self._conn = None
         else:
             logger.debug("Database connection already closed")
-    
+
+
     def __enter__(self):
         return self
+
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
@@ -566,7 +597,8 @@ class SessionManager:
         finally:
             self.cleanup()
         return False
-    
+
+
     def wait_for_agent_response(self, user_message_id: str, timeout_seconds: int = 120) -> str:
         """
         Блокирующее ожидание появления ответа агента в БД.

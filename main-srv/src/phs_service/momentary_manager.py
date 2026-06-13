@@ -17,7 +17,13 @@ Features:
 - All changes create NEW rows (immutable history), old rows deactivated via is_active=FALSE.
 - Full traceability: output_data contains IDs before/after for all operations (momentary_id_before/after, baseline_id).
 - Auto-populates event_payload with human-readable prompt_description from delta_reasons for LLM self-awareness.
-
+- Applies dialogue event shifts (dialog_start, dialog_end, dialogue_timeout) directly to momentary state.
+    • Reads shift parameters (delta cortisol/dopamine/oxytocin) from state.settings as JSON.
+    • Clamps resulting values to physiological range [0..100].
+    • Recalculates valence, state_vector, and state_id based on new hormone levels.
+    • Deactivates current momentary, creates a new row with is_active=TRUE.
+    • Uses event_type_id from state.delta_reasons and populates event_payload automatically.
+    
 Architecture:
 - One active momentary slice per actor at any time (enforced by is_active flag).
 - Decay and sedimentation are separate processes:
@@ -27,7 +33,7 @@ Architecture:
 - event_payload is freely writable: can contain prompt_description or custom code-generated text.
 """
 
-version = "1.2.0"
+version = "1.2.1"
 description = "Momentary hormonal state manager"
 
 import logging
@@ -81,6 +87,7 @@ class MomentaryManager:
         self.encoder = HormonalVectorEncoder(db_config)
         logger.debug("MomentaryManager initialized.")
 
+
     def _get_active_dialogue_id(self, actor_id: str) -> Optional[str]:
         """
         Возвращает UUID активного диалога для актора или None.
@@ -95,6 +102,7 @@ class MomentaryManager:
                 row = cur.fetchone()
                 return str(row[0]) if row else None
     
+
     def _get_setting_float(self, param_name: str, default: float = 0.0) -> float:
         """
         Получает числовое значение параметра из state.settings.
@@ -160,6 +168,7 @@ class MomentaryManager:
 
         return None
     
+
     def create_momentary_from_baseline(
         self,
         session_id: str,
@@ -348,6 +357,7 @@ class MomentaryManager:
             "alpha": alpha
         }
 
+
     def sediment_all_active_momentaries(
         self,
         reason_code: str
@@ -474,6 +484,7 @@ class MomentaryManager:
                 conn.commit()
         
         return new_id
+
 
     def handle_decay_task(self, task_id: str, input_data: dict) -> None:
         """
@@ -729,3 +740,132 @@ class MomentaryManager:
                 conn.commit()
 
         return momentary_id
+    
+
+    def apply_dialogue_event_shift(
+        self, 
+        event_code: str, 
+        actor_id: str, 
+        step_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Применяет сдвиг momentary на основе диалогового события.
+        Читает параметры сдвига из state.settings (value_json).
+        
+        Логика:
+        1. Находит активный momentary для actor_id.
+        2. Читает JSON сдвига из state.settings (momentary_shift_{event_code}).
+        3. Применяет сдвиг с учетом физиологических границ [0..100].
+        4. Пересчитывает valence, vector, state_id.
+        5. Создает новую запись momentary, деактивирует старую.
+        
+        Args:
+            event_code: Код события ('dialog_start', 'dialog_end', 'dialogue_timeout').
+            actor_id: UUID пользователя.
+            step_id: UUID шага оркестратора (опционально).
+            
+        Returns:
+            dict | None: Трассировка изменений или None, если не применено.
+        """
+        setting_name = f"momentary_shift_{event_code}"
+        
+        # 1. Читаем JSON сдвиги из настроек
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value_json FROM state.settings WHERE param_name = %s",
+                    (setting_name,)
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    logger.warning(f"No shift settings found for {setting_name}, skipping.")
+                    return None
+                shifts = row[0]
+
+        # 2. Получаем активный momentary для актора
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, session_id, baseline_id, dialog_id, 
+                           cortisol, dopamine, oxytocin
+                    FROM state.momentary 
+                    WHERE actor_id = %s AND is_active = TRUE 
+                    LIMIT 1
+                    """,
+                    (actor_id,)
+                )
+                current_m = cur.fetchone()
+
+        if not current_m:
+            logger.debug(f"No active momentary for actor={actor_id[:8]}, skipping shift.")
+            return None
+
+        before_id = str(current_m["id"])
+        
+        # 3. Применяем сдвиги
+        new_hormones = {}
+        for h in ["cortisol", "dopamine", "oxytocin"]:
+            shift_val = float(shifts.get(h, 0.0))
+            h_new = current_m[h] + shift_val
+            new_hormones[h] = max(0.0, min(100.0, h_new))
+            
+        logger.info(
+            f"Applying dialogue event shift '{event_code}' for actor={actor_id[:8]}: "
+            f"Cortisol {current_m['cortisol']:.1f} -> {new_hormones['cortisol']:.1f}, "
+            f"Dopamine {current_m['dopamine']:.1f} -> {new_hormones['dopamine']:.1f}, "
+            f"Oxytocin {current_m['oxytocin']:.1f} -> {new_hormones['oxytocin']:.1f}"
+        )
+
+        # 4. Пересчет валентности, вектора и классификация
+        new_valence = compute_valence(**new_hormones)
+        new_vector = self.encoder.encode(**new_hormones, valence=new_valence)
+        state_match = self.classifier.classify_vector(new_vector)
+        
+        # 5. Получаем event_type_id для записи
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM state.delta_reasons WHERE event_type_code = %s",
+                    (event_code,)
+                )
+                event_row = cur.fetchone()
+                event_type_id = str(event_row[0]) if event_row else None
+
+        event_payload = self._get_event_payload(event_type_id)
+        
+        # 6. Деактивируем старую запись и создаем новую
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE state.momentary SET is_active = FALSE WHERE id = %s",
+                    (before_id,)
+                )
+                
+                cur.execute(
+                    """
+                    INSERT INTO state.momentary (
+                        session_id, baseline_id, actor_id, dialog_id,
+                        cortisol, dopamine, oxytocin, valence, state_vector,
+                        state_id, event_type_id, event_payload, is_active, agent_version,
+                        orchestrator_step_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        current_m["session_id"], current_m["baseline_id"], actor_id, current_m["dialog_id"],
+                        new_hormones["cortisol"], new_hormones["dopamine"], new_hormones["oxytocin"],
+                        new_valence, new_vector, state_match.state_id,
+                        event_type_id, Json(event_payload) if event_payload else None,
+                        self.agent_version, step_id
+                    )
+                )
+                new_id = str(cur.fetchone()[0])
+                conn.commit()
+
+        return {
+            "applied": True,
+            "momentary_id_before": before_id,
+            "momentary_id_after": new_id,
+            "event_code": event_code
+        }

@@ -2,22 +2,25 @@
 main-srv/src/dialog_services/dialogue_manager.py
 
 A module for dialog management that operates directly on DB (no in-memory state).
+
 Responsible for:
-- Creating new dialogues and closing existing ones
+- Creating new dialogues and closing existing ones.
 - Dialogues are closed by the orchestrator via check_dialogue_timeouts (eager check).
-- Closing dialogues for active sessions on system startup
+- Applies momentary shift (dialogue_timeout) before closing each timed-out dialogue.
+- Closing dialogues for active sessions on system startup.
 
 All functions work directly with the database via psycopg2.
 They don't store state in memory, allowing for safe operation with concurrent users.
 """
 
-version = "1.1.0"
+version = "1.1.1"
 description = "Module for dialog management with DB-configurable timeout"
 
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -46,31 +49,52 @@ def _get_dialogue_timeout_minutes(cur) -> float:
 def check_dialogue_timeouts(db_config: dict) -> int:
     """
     Закрывает все диалоги, у которых last_activity_at старше таймаута.
-    
+    Перед закрытием применяет сдвиг momentary (dialogue_timeout) для каждого actor_id.
     Вызывается оркестратором на каждом пульсе.
-    Использует один UPDATE запрос для эффективности.
-    
+
     Args:
         db_config: параметры подключения к PostgreSQL
-    
+
     Returns:
         int: количество закрытых диалогов
     """
     conn = psycopg2.connect(**db_config)
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
+
     try:
         timeout_minutes = _get_dialogue_timeout_minutes(cur)
         
+        # 1. Находим диалоги, которые уйдут в таймаут
+        cur.execute("""
+            SELECT id, actor_id FROM dialogs.dialogues
+            WHERE status = 'active'
+              AND last_activity_at < NOW() - (%s * INTERVAL '1 minute')
+        """, (timeout_minutes,))
+        
+        doomed_dialogues = cur.fetchall()
+        if not doomed_dialogues:
+            return 0
+            
+        # 2. Применяем сдвиг momentary для уникальных actor_id
+        unique_actors = list({str(d['actor_id']) for d in doomed_dialogues})
+        
+        # Локальный импорт, чтобы избежать циклических зависимостей
+        from phs_service.momentary_manager import MomentaryManager
+        momentary_mgr = MomentaryManager(db_config)
+        
+        for actor_id in unique_actors:
+            momentary_mgr.apply_dialogue_event_shift('dialogue_timeout', actor_id)
+            
+        # 3. Закрываем диалоги одним UPDATE
+        dialogue_ids = [str(d['id']) for d in doomed_dialogues]
         cur.execute("""
             UPDATE dialogs.dialogues
             SET 
                 status = 'completed',
                 reason = 'inactivity_timeout'::dialog_close_reason,
                 end_at = NOW()
-            WHERE status = 'active'
-              AND last_activity_at < NOW() - (%s * INTERVAL '1 minute')
-        """, (timeout_minutes,))
+            WHERE id = ANY(%s::uuid[])
+        """, (dialogue_ids,))
         
         count = cur.rowcount
         conn.commit()
@@ -79,7 +103,7 @@ def check_dialogue_timeouts(db_config: dict) -> int:
             logger.debug(f"Closed {count} dialogue(s) due to inactivity timeout ({timeout_minutes} min)")
         
         return count
-    
+
     except Exception:
         conn.rollback()
         raise
@@ -92,24 +116,23 @@ def ensure_active_dialogue(
     session_id: str,
     actor_id: str,
     agent_version: str
-) -> str:
+) -> str: 
     """
     Возвращает ID активного диалога или создаёт новый.
-    
     ВАЖНО: Не проверяет таймаут! Таймауты обрабатываются оркестратором.
     Если оркестратор закрыл диалог, здесь просто создастся новый.
-    
+
     Логика:
     1. Ищет активный диалог для session_id + actor_id.
-    2. Если найден → обновляет last_activity_at, возвращает ID.
-    3. Если не найден → создаёт новый, возвращает ID.
-    
+    2. Если найден → обновляет last_activity_at, возвращает (ID, False).
+    3. Если не найден → создаёт новый, применяет сдвиг momentary (dialog_start), возвращает ID.
+
     Returns:
         str: UUID активного диалога
     """
     conn = psycopg2.connect(**db_config)
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
+
     try:
         cur.execute("""
             SELECT id, last_activity_at 
@@ -124,7 +147,7 @@ def ensure_active_dialogue(
         
         if active_dialogue:
             # Диалог активен (оркестратор гарантировал, что он не просрочен)
-            dialogue_id = active_dialogue['id']
+            dialogue_id = str(active_dialogue['id'])
             cur.execute(
                 "UPDATE dialogs.dialogues SET last_activity_at = %s WHERE id = %s",
                 (now, dialogue_id)
@@ -133,10 +156,20 @@ def ensure_active_dialogue(
             # Активного диалога нет → создаём новый
             logger.debug("No active dialogue found. Creating new one.")
             dialogue_id = _create_dialogue(cur, session_id, actor_id, agent_version)
+            
+            # === ИНКАПСУЛИРОВАННЫЙ СДВИГ ПГС ===
+            # Применяем реакцию на начало нового диалога (ориентировочный рефлекс)
+            try:
+                from phs_service.momentary_manager import MomentaryManager
+                momentary_mgr = MomentaryManager(db_config)
+                momentary_mgr.apply_dialogue_event_shift('dialog_start', actor_id)
+            except Exception as e:
+                # Ошибка в ПГС не должна ломать создание диалога
+                logger.warning(f"Failed to apply dialog_start PHS shift: {e}")
         
         conn.commit()
         return dialogue_id
-    
+
     except Exception:
         conn.rollback()
         raise
@@ -147,23 +180,36 @@ def ensure_active_dialogue(
 def close_active_dialogue(db_config: dict, session_id: str, actor_id: str, reason: str):
     """
     Закрывает текущий активный диалог с указанной причиной.
+    Автоматически применяет сдвиг momentary (dialog_end) перед закрытием.
     """
     conn = psycopg2.connect(**db_config)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
         cur.execute("""
-            SELECT id FROM dialogs.dialogues 
+            SELECT id FROM dialogs.dialogues
             WHERE actor_id = %s AND session_id = %s AND status = 'active'
             ORDER BY start_at DESC LIMIT 1
         """, (actor_id, session_id))
-        
         row = cur.fetchone()
+        
         if row:
-            _close_dialogue(cur, row['id'], reason)
-            logger.info(f"Active dialogue {row['id'][:8]} closed with reason: {reason}")
+            dialogue_id = str(row['id'])
+            
+            # === ИНКАПСУЛИРОВАННЫЙ СДВИГ ПГС ===
+            # Применяем реакцию на завершение диалога (расслабление/удовлетворение)
+            try:
+                from phs_service.momentary_manager import MomentaryManager
+                momentary_mgr = MomentaryManager(db_config)
+                momentary_mgr.apply_dialogue_event_shift('dialog_end', actor_id)
+            except Exception as e:
+                logger.warning(f"Failed to apply dialog_end PHS shift: {e}")
+                
+            _close_dialogue(cur, dialogue_id, reason)
+            logger.info(f"Active dialogue {dialogue_id[:8]} closed with reason: {reason}")
             conn.commit()
         else:
             logger.debug("No active dialogue to close for this session/actor.")
+            
     except Exception:
         conn.rollback()
         raise

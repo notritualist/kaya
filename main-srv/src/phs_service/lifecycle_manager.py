@@ -18,6 +18,7 @@ Responsibilities:
     - Sediment dangling momentary states on crash
     - Wake up from sleep
     - Apply global baseline shifts on sleep and wake up (inactivity_sleep / wake_up)
+    - Perform graceful shutdown with sedimentation and transition to 'off' state.
 
 Dependencies:
     - BaselineManager (drift, sedimentation)
@@ -27,7 +28,7 @@ Dependencies:
 DB schema: migration V003
 Tables: state.agent_lifecycle, state.shutdown_reasons, state.momentary
 """
-version = "1.3.0"
+version = "1.3.1"
 description = "Global agent lifecycle manager"
 
 import logging
@@ -424,12 +425,13 @@ class LifecycleManager:
     def handle_graceful_shutdown(self, actor_id: str, exit_reason: str) -> None:
         """
         Обрабатывает штатное выключение агента.
-    
+
         Выполняет:
-        1. Осаждение всех активных momentary в baseline с коэффициентом alpha_session_end.
-        2. Массовую деактивацию всех momentary (is_active = false).
-        3. Закрытие lifecycle и переход в off.
-    
+        1. Применяет сдвиг momentary (agent_stop) для всех активных акторов.
+        2. Осаждение всех активных momentary в baseline с коэффициентом alpha_session_end.
+        3. Массовую деактивацию всех momentary (is_active = false).
+        4. Закрытие lifecycle и переход в off.
+
         Args:
             actor_id: UUID актора, инициировавшего выключение.
             exit_reason: Причина выхода (user_exit, user_command).
@@ -446,14 +448,22 @@ class LifecycleManager:
                 active_actors = [str(row[0]) for row in cur.fetchall()]  # ← Исправлено
         
         if active_actors:
-            # === 2. Осаждение опыта всех пользователей ===
+            # === 2. Применяем сдвиг agent_stop (расслабление перед осаждением) ===
+            logger.info(f"Applying 'agent_stop' shift for {len(active_actors)} active actor(s)...")
+            for aid in active_actors:
+                try:
+                    momentary_mgr.apply_dialogue_event_shift('agent_stop', aid)
+                except Exception as e:
+                    logger.warning(f"Failed to apply agent_stop shift for actor {aid[:8]}: {e}")
+
+            # === 3. Осаждение опыта всех пользователей ===
             alpha = self._get_setting_float("alpha_session_end", default=0.2)
             for aid in active_actors:
                 momentary_mgr.sediment_momentary_to_baseline(
                     actor_id=aid, alpha=alpha, reason_code="session_end_sedimentation"
                 )
 
-            # === 3. Массовая деактивация всех обработанных записей ===
+            # === 4. Массовая деактивация всех обработанных записей ===
             with psycopg2.connect(**self.db_config) as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -464,9 +474,9 @@ class LifecycleManager:
                     conn.commit()
             logger.info(f"Sedimented and deactivated {len(active_actors)} active momentaries.")
         else:
-            logger.info("No active momentaries to sediment.")
+            logger.info("No active momentaries to process.")
 
-        # === 4. Закрытие lifecycle ===
+        # === 5. Закрытие lifecycle ===
         shutdown_type = self._prompt_shutdown_reason()
         shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
 
