@@ -24,6 +24,8 @@ tasks/
 interesting/
 workbook/
 tests/
+README_ru.md
+README_en.md
 *.swp
 *.swo
 
