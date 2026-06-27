@@ -2,7 +2,7 @@
 
 services:
   postgres_db:
-    image: pgvector/pgvector:pg18-trixie
+    image: pgvector/pgvector:0.8.3-pg18-trixie
     container_name: postgres_db
     restart: unless-stopped
     environment:
@@ -24,7 +24,7 @@ services:
         max-file: "3"
 
   qdrant: 
-    image: qdrant/qdrant:latest 
+    image: qdrant/qdrant:v1.18.2 
     container_name: qdrant_db
     restart: unless-stopped 
     volumes: 
