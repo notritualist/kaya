@@ -23,17 +23,47 @@ Features:
     • Recalculates valence, state_vector, and state_id based on new hormone levels.
     • Deactivates current momentary, creates a new row with is_active=TRUE.
     • Uses event_type_id from state.delta_reasons and populates event_payload automatically.
-    
+
+- Applies affective analysis shifts via apply_affective_shift():
+    • Accepts raw hormone deltas from pre-reflexive affective analyzer.
+    • Scales deltas by affective_shift_scale_factor from state.settings.
+    • Three biological dampening mechanisms applied sequentially:
+      1. Saturation (level-based): positive shifts dampen as level approaches 100,
+         negative shifts dampen as level approaches 0.
+      2. Habituation (stimulus-based): all three hormones dampen as message count
+         grows within session. Models receptor desensitization:
+         - Oxytocin (K=0.10, floor=0.2): attachment habituation
+         - Cortisol (K=0.05, floor=0.3): chronic stress burnout
+         - Dopamine (K=0.15, floor=0.1): reward prediction error / tolerance
+      3. Receptor adaptation (downregulation): prolonged high levels reduce
+         sensitivity to new stimuli over time.
+    • Formula: effective = raw * scale * saturation * habituation * adaptation
+    • Applies cross-inhibition: oxytocin suppresses cortisol (and vice versa),
+      cortisol modulates dopamine (Yerkes-Dodson law).
+    • Returns applied_deltas in result: actual hormone changes after all
+      biological mechanisms. Used by affective_analyzer for salience calculation —
+      reflects real impact on agent, not raw stimulus strength.
+    • Recalculates valence, state_vector, state_id after shift.
+    • Logs event as 'affective_response' with prompt_description from delta_reasons.
+
 Architecture:
 - One active momentary slice per actor at any time (enforced by is_active flag).
 - Decay and sedimentation are separate processes:
     • Decay: momentary → baseline (continuous, every 60s)
     • Sedimentation: momentary → baseline (discrete events: session end/hourly/crash)
+- Affective shifts are applied after successful pre-reflexive analysis with full biological dynamics.
 - Integrates with BaselineManager for sedimentation and state classification.
-- event_payload is freely writable: can contain prompt_description or custom code-generated text.
+- event_payload contains ONLY human-readable prompt_description from delta_reasons (no JSON debug data).
+
+Dependencies:
+- phs_service.state_classifier.StateClassifier
+- phs_service.baseline_manager.BaselineManager
+- phs_service.valence_calculator.compute_valence
+- phs_service.vector_encoder.HormonalVectorEncoder
+- services.service_metrics (task/step management)
 """
 
-version = "1.2.2"
+version = "1.3.0"
 description = "Momentary hormonal state manager"
 
 import logging
@@ -63,6 +93,57 @@ REASON_SESSION_END: str = "session_end_sedimentation"
 REASON_HOURLY_SEDIMENTATION: str = "hourly_sedimentation"
 REASON_CRASH_SEDIMENTATION: str = "crash_sedimentation"
 
+# =============================================================================
+# РЕЦЕПТОРНАЯ ГАБИТУАЦИЯ (Habituation) — привыкание к повторяющимся стимулам
+# =============================================================================
+# Биологический механизм: при повторяющейся стимуляции рецепторы десенситизируются.
+# Каждое следующее сообщение в рамках сессии вызывает меньший гормональный отклик.
+#
+# Формула: factor = max(FLOOR, 1.0 / (1.0 + msg_count * K))
+#
+# Константы для каждого гормона (скорость привыкания разная):
+#
+# OKSITOCIN (K=0.10, FLOOR=0.2):
+#   Привязанность формируется, но не мгновенно. При 10 сообщениях factor=0.50.
+#   Floor=0.2: даже при 100+ сообщениях базовая эмпатия сохраняется.
+#
+# CORTISOL (K=0.05, FLOOR=0.3):
+#   Стресс накапливается медленно (хронический стресс ≠ острая реакция).
+#   При 10 сообщениях factor=0.67. При 20 сообщениях factor=0.50.
+#   Floor=0.3: при длительном стрессе рецепторы "выгорают", но базовая тревожность остаётся.
+#
+# DOPAMINE (K=0.15, FLOOR=0.1):
+#   Быстрая толерантность к наградам (Reward Prediction Error).
+#   При 5 сообщениях factor=0.57. При 10 сообщениях factor=0.40.
+#   Floor=0.1: тонический дофамин всегда присутствует (базовая мотивация).
+#
+#Биологическая модель отклика нейромедиаторов на количество сообщений в сессии.
+#
+#Таблица коэффициентов затухания (множители от 0.0 до 1.0):
+#-----------------------------------------------------------
+#| Сообщений | Окситоцин | Кортизол | Дофамин |
+#|-----------|-----------|----------|---------|
+#| 1         | 0.91      | 0.95     | 0.87    |
+#| 5         | 0.67      | 0.80     | 0.57    |
+#| 10        | 0.50      | 0.67     | 0.40    |
+#| 20        | 0.33      | 0.50     | 0.25    |
+#| 50        | 0.20      | 0.33     | 0.12    |
+#| 100+      | 0.20      | 0.30     | 0.10    |
+#-----------------------------------------------------------
+#Примечания:
+#- Для Окситоцина и Кортизола значение 0.20 и 0.30 соответственно являются "полом" (floor).
+#- Для Дофамина "пол" (floor) = 0.10.
+#- Используется линейная интерполяция между точками или выбор ближайшего меньшего значения.
+# =============================================================================
+HABITUATION_OXYTOCIN_K = 0.05
+HABITUATION_OXYTOCIN_FLOOR = 0.3
+
+HABITUATION_CORTISOL_K = 0.03
+HABITUATION_CORTISOL_FLOOR = 0.5
+
+HABITUATION_DOPAMINE_K = 0.08
+HABITUATION_DOPAMINE_FLOOR = 0.2
+
 
 class MomentaryManager:
     """
@@ -72,7 +153,6 @@ class MomentaryManager:
     Все изменения создают НОВЫЕ записи, старые деактивируются.
     Возвращает полную трассировку изменений (ID до/после).
     """
-
     def __init__(self, db_config: Dict[str, Any]):
         """
         Инициализация менеджера momentary.
@@ -87,7 +167,6 @@ class MomentaryManager:
         self.encoder = HormonalVectorEncoder(db_config)
         logger.debug("MomentaryManager initialized.")
 
-
     def _get_active_dialogue_id(self, actor_id: str) -> Optional[str]:
         """
         Возвращает UUID активного диалога для актора или None.
@@ -101,8 +180,7 @@ class MomentaryManager:
                 """, (actor_id,))
                 row = cur.fetchone()
                 return str(row[0]) if row else None
-    
-
+ 
     def _get_setting_float(self, param_name: str, default: float = 0.0) -> float:
         """
         Получает числовое значение параметра из state.settings.
@@ -124,8 +202,7 @@ class MomentaryManager:
                 if not row or row[0] is None:
                     return default
                 return float(row[0])
-    
-    
+     
     def _get_event_payload(
         self,
         event_type_id: Optional[str],
@@ -167,8 +244,7 @@ class MomentaryManager:
                     return {"prompt_description": row[0]}
 
         return None
-    
-
+ 
     def create_momentary_from_baseline(
         self,
         session_id: str,
@@ -273,7 +349,6 @@ class MomentaryManager:
         )
         return momentary_id
 
-
     def sediment_momentary_to_baseline(
         self,
         actor_id: str,
@@ -357,7 +432,6 @@ class MomentaryManager:
             "alpha": alpha
         }
 
-
     def sediment_all_active_momentaries(
         self,
         reason_code: str
@@ -397,7 +471,6 @@ class MomentaryManager:
         
         logger.info(f"Sedimented {count} momentaries with reason={reason_code}")
         return count
-        
      
     def close_dangling_momentary(self) -> int:
         """
@@ -424,7 +497,6 @@ class MomentaryManager:
         if count > 0:
             logger.warning(f"Closed {count} dangling momentary records on startup.")
         return count
-
     
     def _insert_baseline_with_state(
         self,
@@ -485,7 +557,6 @@ class MomentaryManager:
         
         return new_id
 
-
     def handle_decay_task(self, task_id: str, input_data: dict) -> None:
         """
         Обрабатывает задачу затухания momentary.
@@ -515,7 +586,6 @@ class MomentaryManager:
             complete_task_error(task_id, "phs_service", str(e))
             raise
     
-
     def apply_decay_tick(self, step_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Применяет затухание momentary к baseline для всех активных акторов.
@@ -582,6 +652,7 @@ class MomentaryManager:
                     FROM state.momentary m
                     JOIN state.baseline_phs b ON b.is_active = TRUE
                     WHERE m.is_active = TRUE
+                    FOR UPDATE OF m
                 """)
                 momentaries = cur.fetchall()
         
@@ -629,10 +700,10 @@ class MomentaryManager:
             # === СОЗДАЁМ НОВУЮ ЗАПИСЬ И ДЕАКТИВИРУЕМ СТАРУЮ ===
             with psycopg2.connect(**self.db_config) as conn:
                 with conn.cursor() as cur:
-                    # Деактивируем предыдущую запись (иммутабельная история)
+                    # Деактивируем ВСЕ активные записи для этого актора (защита от race condition)
                     cur.execute(
-                        "UPDATE state.momentary SET is_active = FALSE WHERE id = %s",
-                        (m['id'],)
+                        "UPDATE state.momentary SET is_active = FALSE WHERE actor_id = %s AND is_active = TRUE",
+                        (m['actor_id'],)
                     )
                     
                     # Автозаполнение dialog_id (если есть активный диалог)
@@ -680,7 +751,6 @@ class MomentaryManager:
             "dt": dt
         }
     
-
     def _create_momentary_record(
         self,
         session_id: str,
@@ -749,7 +819,6 @@ class MomentaryManager:
 
         return momentary_id
     
-
     def apply_dialogue_event_shift(
         self, 
         event_code: str, 
@@ -895,4 +964,270 @@ class MomentaryManager:
             "momentary_id_before": before_id,
             "momentary_id_after": new_id,
             "event_code": event_code
+        }
+    
+    def apply_affective_shift(
+        self,
+        actor_id: str,
+        deltas: Dict[str, float],
+        step_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Применяет сдвиг momentary на основе результата аффективного анализа.
+        
+        Отличия от apply_dialogue_event_shift:
+        - Дельты приходят из кода анализа, а не из state.settings.
+        - Перед применением умножаются на affective_shift_scale_factor из state.settings
+        (защита от накопления экстремумов в длинных диалогах).
+        - Габитуация (насыщение рецепторов) применяется ПОСЛЕ масштабирования,
+        по той же формуле, что и для диалоговых событий.
+        
+        Формула итогового сдвига для каждого гормона:
+            effective = (raw_delta * scale_factor) * habituation_factor
+        
+        где habituation_factor:
+            - для положительных сдвигов: (1.0 - current_level / 100.0)
+            - для отрицательных сдвигов: (current_level / 100.0)
+        
+        Args:
+            actor_id: UUID пользователя.
+            deltas: Словарь с сырыми дельтами из анализа:
+                    {"oxytocin_delta": X, "cortisol_delta": Y, "dopamine_delta": Z}.
+            step_id: UUID шага оркестратора (опционально).
+            payload_extras: Дополнительные данные для event_payload 
+                            (например, agent_state, detected_patterns).
+            
+        Returns:
+            dict | None: Трассировка изменений или None, если не применено.
+                Структура возвращаемого словаря:
+                - applied: bool — флаг успешного применения
+                - momentary_id_before: str — UUID моментари ДО сдвига
+                - momentary_id_after: str — UUID моментари ПОСЛЕ сдвига
+                - event_code: str — код события ("affective_response")
+                - scale_factor: float — коэффициент масштабирования из настроек
+                - applied_deltas: dict — ФАКТИЧЕСКИЕ применённые дельты гормонов
+                    после всех биологических механизмов (габитуация, сатурация,
+                    cross-inhibition, адаптация). Используется affective_analyzer
+                    для расчёта salience — отражает реальное влияние события на агента,
+                    а не силу исходного стимула.
+                    Структура: {"oxytocin_delta": X, "cortisol_delta": Y, "dopamine_delta": Z}
+        """
+        if not deltas:
+            logger.debug(f"No deltas provided for affective shift, actor={actor_id[:8]}")
+            return None
+        
+        # === 1. Читаем коэффициент масштабирования ===
+        scale_factor = self._get_setting_float("affective_shift_scale_factor", default=0.3)
+        if scale_factor <= 0.0:
+            logger.debug("affective_shift_scale_factor is zero, skipping affective shift")
+            return None
+        
+        # === 2. Получаем активный momentary ===
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, session_id, baseline_id, dialog_id,
+                        cortisol, dopamine, oxytocin, recorded_at
+                    FROM state.momentary
+                    WHERE actor_id = %s AND is_active = TRUE
+                    LIMIT 1
+                """, (actor_id,))
+                current_m = cur.fetchone()
+        
+        if not current_m:
+            logger.debug(f"No active momentary for actor={actor_id[:8]}, skipping affective shift")
+            return None
+        
+        before_id = str(current_m["id"])
+        
+        # === 3. Применяем сдвиги С УЧЕТОМ АДАПТАЦИИ И CROSS-INHIBITION ===
+        # 3.1 Загружаем параметры адаптации и cross-inhibition
+        adaptation_k = self._get_setting_float("affective_adaptation_k", default=0.01)
+        cross_o_c = self._get_setting_float("cross_inhibition_o_c", default=0.1)
+        cross_c_o = self._get_setting_float("cross_inhibition_c_o", default=0.05)
+        optimal_cortisol = self._get_setting_float("cross_inhibition_optimal_cortisol", default=60.0)
+        dopamine_sensitivity = self._get_setting_float("cross_inhibition_dopamine_sensitivity", default=0.005)
+                        
+        # 3.2 Получаем baseline для расчёта длительности выше базы
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT cortisol, dopamine, oxytocin
+                    FROM state.baseline_phs 
+                    WHERE id = %s
+                """, (current_m["baseline_id"],))
+                baseline = cur.fetchone()
+        
+        if not baseline:
+            logger.warning("No baseline found for adaptation calculation")
+            baseline = {"cortisol": 50.0, "dopamine": 30.0, "oxytocin": 20.0}
+        
+        # 3.3 Рассчитываем длительность выше baseline (в минутах)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        recorded_at = current_m["recorded_at"]
+        if recorded_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        
+        duration_minutes = (now - recorded_at).total_seconds() / 60.0
+        
+        # 3.4 Рецепторная адаптация (downregulation)
+        def get_adaptation_factor(current_level: float, baseline_level: float) -> float:
+            """Чем дольше гормон выше базы, тем слабее эффект нового стимула"""
+            if current_level > baseline_level:
+                return 1.0 / (1.0 + duration_minutes * adaptation_k)
+            return 1.0
+        
+        # === 3.5 Применяем масштабирование + saturation + habituation ===
+        new_hormones = {}
+        
+        # Получаем количество сообщений в текущей сессии (для habituation)
+        msg_count = 0
+        if current_m.get("session_id"):
+            with psycopg2.connect(**self.db_config) as conn2:
+                with conn2.cursor() as cur2:
+                    cur2.execute("""
+                        SELECT COUNT(*) FROM dialogs.row_messages 
+                        WHERE session_id = %s AND actor_id = %s
+                    """, (current_m["session_id"], actor_id))
+                    row = cur2.fetchone()
+                    if row:
+                        msg_count = row[0]
+        
+        # Маппинг констант habituation для каждого гормона
+        habituation_config = {
+            "oxytocin": {"K": HABITUATION_OXYTOCIN_K, "FLOOR": HABITUATION_OXYTOCIN_FLOOR},
+            "cortisol": {"K": HABITUATION_CORTISOL_K, "FLOOR": HABITUATION_CORTISOL_FLOOR},
+            "dopamine": {"K": HABITUATION_DOPAMINE_K, "FLOOR": HABITUATION_DOPAMINE_FLOOR},
+        }
+        
+        for h in ["cortisol", "dopamine", "oxytocin"]:
+            raw_delta = float(deltas.get(f"{h}_delta", 0.0))
+            current_level = current_m[h]
+            
+            # --- Механизм 1: Saturation (насыщение по уровню) ---
+            # Чем выше текущий уровень, тем слабее новый положительный сдвиг
+            # Чем ниже текущий уровень, тем слабее новый отрицательный сдвиг
+            if raw_delta >= 0:
+                saturation_factor = 1.0 - (current_level / 100.0)
+            else:
+                saturation_factor = current_level / 100.0
+            
+            # --- Механизм 2: Habituation (привыкание к повторяющимся стимулам) ---
+            # Каждое следующее сообщение в сессии вызывает меньший отклик
+            h_config = habituation_config[h]
+            habituation_factor = max(
+                h_config["FLOOR"],
+                1.0 / (1.0 + msg_count * h_config["K"])
+            )
+            
+            # Итоговый сдвиг: raw * scale * saturation * habituation
+            effective_shift = raw_delta * scale_factor * saturation_factor * habituation_factor
+            
+            h_new = current_level + effective_shift
+            new_hormones[h] = max(0.0, min(100.0, h_new))
+            
+            logger.debug(
+                f"{h}: raw={raw_delta:.2f}, sat={saturation_factor:.2f}, "
+                f"hab={habituation_factor:.2f} (msg={msg_count}), "
+                f"effective={effective_shift:.2f}, {current_level:.1f} -> {h_new:.1f}"
+            )
+        
+        # 3.7 Cross-inhibition между гормонами
+        O_new = new_hormones["oxytocin"]
+        C_new = new_hormones["cortisol"]
+        D_new = new_hormones["dopamine"]
+        
+        # Окситоцин гасит кортизол (и наоборот)
+        C_new -= cross_o_c * max(0, O_new - 50)
+        O_new -= cross_c_o * max(0, C_new - 60)
+        
+        # Дофамин модулируется кортизолом (Yerkes-Dodson law)
+        cortisol_deviation = abs(C_new - optimal_cortisol)
+        D_new *= max(0.3, 1.0 - dopamine_sensitivity * cortisol_deviation)
+        
+        # Clamp после cross-inhibition
+        new_hormones["oxytocin"] = max(0.0, min(100.0, O_new))
+        new_hormones["cortisol"] = max(0.0, min(100.0, C_new))
+        new_hormones["dopamine"] = max(0.0, min(100.0, D_new))
+        
+        logger.info(
+            f"Applying affective shift for actor={actor_id[:8]} (scale={scale_factor}, "
+            f"adaptation={adaptation_k}, cross-inhibition enabled): "
+            f"Cortisol {current_m['cortisol']:.1f} -> {new_hormones['cortisol']:.1f}, "
+            f"Dopamine {current_m['dopamine']:.1f} -> {new_hormones['dopamine']:.1f}, "
+            f"Oxytocin {current_m['oxytocin']:.1f} -> {new_hormones['oxytocin']:.1f}"
+        )
+        
+        # === 4. Пересчёт валентности, вектора, состояния ===
+        new_valence = compute_valence(**new_hormones)
+        new_vector = self.encoder.encode(**new_hormones, valence=new_valence)
+        state_match = self.classifier.classify_vector(new_vector)
+        
+        # === 5. Получаем event_type_id ===
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM state.delta_reasons WHERE event_type_code = %s",
+                    ("affective_response",)
+                )
+                event_row = cur.fetchone()
+                event_type_id = str(event_row[0]) if event_row else None
+        
+        # === 6. Формируем event_payload ===
+        # ВАЖНО: event_payload предназначен ТОЛЬКО для человекочитаемого описания состояния.
+        # Берём prompt_description из state.delta_reasons через стандартный хелпер.
+        # Трассировка (analysis_id, deltas, patterns) уже лежит в state.affective_analyses.
+        base_payload = self._get_event_payload(event_type_id)
+        
+        # === 7. Деактивируем старую запись, создаём новую ===
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE state.momentary SET is_active = FALSE WHERE id = %s",
+                    (before_id,)
+                )
+                
+                dialog_id = self._get_active_dialogue_id(actor_id)
+                
+                cur.execute("""
+                    INSERT INTO state.momentary (
+                        session_id, baseline_id, actor_id, dialog_id,
+                        cortisol, dopamine, oxytocin, valence, state_vector,
+                        state_id, event_type_id, event_payload, is_active, agent_version,
+                        orchestrator_step_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                    RETURNING id
+                """, (
+                    current_m["session_id"], current_m["baseline_id"], actor_id, dialog_id,
+                    new_hormones["cortisol"], new_hormones["dopamine"], new_hormones["oxytocin"],
+                    new_valence, new_vector, state_match.state_id,
+                    event_type_id, Json(base_payload),
+                    self.agent_version, step_id
+                ))
+                new_id = str(cur.fetchone()[0])
+                conn.commit()
+        
+        # === Фактические применённые дельты (для salience и аналитики) ===
+        # Разница между текущими и новыми значениями — реальный вклад события
+        # с учётом всех биологических механизмов (габитуация, сатурация, cross-inhibition)
+        applied_deltas = {
+            "oxytocin_delta": round(new_hormones["oxytocin"] - current_m["oxytocin"], 2),
+            "cortisol_delta": round(new_hormones["cortisol"] - current_m["cortisol"], 2),
+            "dopamine_delta": round(new_hormones["dopamine"] - current_m["dopamine"], 2),
+        }
+        
+        logger.info(
+            f"Affective shift applied: {before_id[:8]} -> {new_id[:8]}, "
+            f"raw_deltas=({deltas.get('oxytocin_delta', 0):.1f},{deltas.get('cortisol_delta', 0):.1f},{deltas.get('dopamine_delta', 0):.1f}), "
+            f"applied=({applied_deltas['oxytocin_delta']:.1f},{applied_deltas['cortisol_delta']:.1f},{applied_deltas['dopamine_delta']:.1f})"
+        )
+        
+        return {
+            "applied": True,
+            "momentary_id_before": before_id,
+            "momentary_id_after": new_id,
+            "event_code": "affective_response",
+            "scale_factor": scale_factor,
+            "applied_deltas": applied_deltas  # ← НОВОЕ: фактические дельты для salience
         }

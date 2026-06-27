@@ -83,6 +83,7 @@ agent/
 │        │
 │        ├── phs_service/         # Pseudohormonal System (PHS)
 │        │   ├── __init__.py
+│        │   ├── affective_analyzer.py   # Pre-reflexive Affective Analyzer Module of dialogue
 │        │   ├── baseline_manager.py     # Baseline management: initialization, OU drift, shutdown effects
 │        │   ├── momentary_manager.py    # Momentary slice management: creation, decay, sedimentation
 │        │   ├── state_classifier.py     # State classification: cosine similarity with self_knowledge prototypes

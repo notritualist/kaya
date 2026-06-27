@@ -5,7 +5,7 @@ Provider for the local llama-server (OpenAI-compatible API).
 Supports Qwen 3.5-9b with a separate reasoning_content field.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __description__ = "Local llama-server provider via HTTP API"
 
 import logging
@@ -185,19 +185,26 @@ class LocalLlamaProvider(LLMProvider):
             }
         
         result = self._parse_response(raw["data"], model_name)
-        
+    
         # Проверка на пустой ответ + одна попытка регенерации
-        if not result.get("response", "").strip():
-            logger.error("Empty response from model %s", model_name)
+        if not result.get("response", " ").strip():
+            # ИЗМЕНЕНО: Это восстанавливаемая ошибка, понижаем уровень лога
+            logger.warning(
+                "Empty response from model %s on first attempt, retrying... "
+                "(Possible server-side cache invalidation or transient glitch)",
+                model_name
+            )
             retry_raw = self._call_server(payload, model_name)
             if retry_raw["success"]:
                 retry = self._parse_response(retry_raw["data"], model_name)
-                if retry.get("response", "").strip():
+                if retry.get("response", " ").strip():
+                    logger.debug("Retry succeeded for model %s", model_name)
                     return retry
+            # Если retry не помог — только тогда ошибка
             return {
                 "success": False,
-                "response": "",
-                "reasoning_content": result.get("reasoning_content", ""),
+                "response": " ",
+                "reasoning_content": result.get("reasoning_content", " "),
                 "metrics": result.get("metrics", {}),
                 "error": "Empty response after retry"
             }

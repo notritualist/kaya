@@ -6,6 +6,8 @@ Utility module for updating statuses and saving metrics.
 Module responsibilities:
 - Update task and step statuses in orchestrator.orchestrator_tasks / _steps
 - Store LLM query metrics in metrics.llm_internal
+- Store full textual LLM artifacts (messages, raw response, final params, agent version)
+  in metrics.llm_artifacts for analytics and debugging
 - Store reasoning in orchestrator.reasonings
 - Bind reasoning and metrics to orchestrator steps
 - Stamp steps and reasonings with PHS snapshot (baseline_id, momentary_id) via V004
@@ -15,15 +17,25 @@ Architecture:
 - PHS stamps (baseline_id, momentary_id) are optional parameters.
 - For dialog-bound operations, callers should pass PHS IDs from get_current_phs_snapshot().
 - For background PHS tasks (drift, decay), stamps may be None.
+
+Main functions:
+- update_task_status(...)
+- update_step_status(...)
+- save_llm_metric(...)
+- save_llm_artifacts(...)      # <-- добавлена
+- save_reasoning(...)
+- bind_reasoning_to_step(...)
+- bind_metric_to_step(...)
+- stamp_with_phs(...)
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Utility module for updating statuses and saving metrics"
 
 import logging
 import psycopg2
 from psycopg2.extras import Json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
 # Локальные импорты
@@ -38,7 +50,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # === УПРАВЛЕНИЕ СТАТУСАМИ ЗАДАЧ И ШАГОВ ===
 # =============================================================================
-
 def mark_task_running(task_id: str) -> None:
     """
     Помечает задачу как выполняющуюся (status='running').
@@ -63,7 +74,6 @@ def mark_task_running(task_id: str) -> None:
             conn.commit()
     logger.debug("ЗTask %s is marked as running", task_id[:8])
 
-
 def complete_task_success(task_id: str, output_data: Optional[Dict[str, Any]] = None) -> None:
     """
     Завершает задачу успешно (status='completed').
@@ -87,7 +97,6 @@ def complete_task_success(task_id: str, output_data: Optional[Dict[str, Any]] = 
             """, (Json(output_data) if output_data else None, task_id))
             conn.commit()
     logger.info("Task %s completed successfully", task_id[:8])
-
 
 def complete_task_error(
         task_id: str,
@@ -121,7 +130,6 @@ def complete_task_error(
                 """, (error_module, error_message, task_id))
                 conn.commit()
         logger.warning("Task %s completed with error: %s", task_id[:8], error_message)
-
 
 def create_orchestrator_step(
     task_id: str,
@@ -190,7 +198,6 @@ def create_orchestrator_step(
     logger.debug("Step %s created for task %s (type: %s)", step_id[:8], task_id[:8], step_type_name)
     return step_id
 
-
 def complete_step_success(step_id: str, output_data: Optional[Dict[str, Any]] = None) -> None:
     """
     Завершает шаг успешно (status='completed').
@@ -213,7 +220,6 @@ def complete_step_success(step_id: str, output_data: Optional[Dict[str, Any]] = 
             """, (Json(output_data) if output_data else None, step_id))
             conn.commit()
     logger.debug("Step %s completed successfully", step_id[:8])
-
 
 def complete_step_error(
     step_id: str,
@@ -249,7 +255,6 @@ def complete_step_error(
 # =============================================================================
 # === СОХРАНЕНИЕ МЕТРИК И РАССУЖДЕНИЙ ===
 # =============================================================================
-
 def save_llm_metrics(
     orchestrator_step_id: str,
     prompt_id: str,
@@ -359,7 +364,6 @@ def save_llm_metrics(
     logger.debug("LLM metrics saved: %s (step: %s)", metric_id[:8], orchestrator_step_id[:8])
     return metric_id
 
-
 def save_reasoning(
     orchestrator_step_id: str,
     content: str,
@@ -415,7 +419,6 @@ def save_reasoning(
     logger.debug("Reasoning saved: %s (step: %s)", reasoning_id[:8], orchestrator_step_id[:8])
     return reasoning_id
 
-
 def set_step_llm_metric_id(step_id: str, llm_metric_id: str) -> None:
     """
     Привязывает запись метрики LLM к шагу оркестратора.
@@ -435,7 +438,6 @@ def set_step_llm_metric_id(step_id: str, llm_metric_id: str) -> None:
             conn.commit()
     logger.debug("Linked llm_metric_id %s to step %s", llm_metric_id[:8], step_id[:8])
 
-
 def set_step_reasoning_id(step_id: str, reasoning_id: str) -> None:
     """
     Привязывает запись рассуждения к шагу оркестратора.
@@ -454,3 +456,41 @@ def set_step_reasoning_id(step_id: str, reasoning_id: str) -> None:
     # поэтому обратная ссылка не требуется. Функция оставлена для будущего расширения.
     logger.debug("Reasoning %s already linked to step %s via FK", reasoning_id[:8], step_id[:8])
     pass
+
+def save_llm_artifacts(
+    llm_metric_id: str,
+    orchestrator_step_id: Optional[str],
+    messages: List[Dict[str, str]],
+    raw_response: str,
+    final_params: Dict[str, Any]
+) -> str:
+    """
+    Сохраняет полные текстовые артефакты LLM-запроса для аналитики.
+    
+    Args:
+        llm_metric_id: UUID из metrics.llm_internal
+        orchestrator_step_id: UUID шага оркестратора
+        messages: Полный массив messages [{role, content}, ...]
+        raw_response: Сырой текстовый ответ модели
+        final_params: Фактически использованные параметры генерации
+        
+    Returns:
+        str: UUID созданной записи
+    """
+    db_config = load_postgres_config()
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO metrics.llm_artifacts (
+                    llm_metric_id, orchestrator_step_id,
+                    messages_json, raw_response, final_params, agent_version
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                llm_metric_id, orchestrator_step_id,
+                Json(messages), raw_response, Json(final_params), agent_version
+            ))
+            artifact_id = str(cur.fetchone()[0])
+            conn.commit()
+    logger.debug(f"LLM artifacts saved: {artifact_id[:8]} (metric: {llm_metric_id[:8]})")
+    return artifact_id

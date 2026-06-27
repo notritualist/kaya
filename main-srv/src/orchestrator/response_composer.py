@@ -4,23 +4,34 @@ main-srv/src/orchestrator/response_composer.py
 Module for generating the final response to the user.
 
 Logic:
-- Get the user's message from the database
-- Get the prompt and generation parameters from orchestrator.prompts.params
-- Call ModelService.generate() with the parameters from the prompt
-- Process the response:
-  * Extract <think/COT> → save to orchestrator.reasonings (with PHS stamps)
-  * Save the response to dialogs.row_messages (with PHS stamps)
-  * Trigger PHS momentary shift 'agent_response' after successful save
-- Write metrics to metrics.llm_internal and the orchestrator step
-- Complete the orchestrator task/step
+1. Get the user's message from the database
+2. Get the prompt and generation parameters from orchestrator.prompts.params
+3. Load settings from state.settings:
+   - use_momentary_state_in_generation: whether to substitute {{my_state}}
+   - use_affective_gen_params: whether to use parameters from affective analysis
+4. If use_momentary_state_in_generation=1.0:
+   - Read state.self_knowledge.content via momentary.state_id
+   - Substitute into {{my_state}} placeholder
+5. If use_affective_gen_params=1.0:
+   - Read recommended_gen_params from latest affective_analyses
+   - Merge over prompt parameters
+6. Build dialogue history (last N messages)
+7. Calculate token limits and truncate history if needed
+8. Call ModelService.generate()
+9. Save full artifacts to metrics.llm_artifacts
+10. Save response to dialogs.row_messages (with PHS stamps)
+11. Trigger PHS momentary shift 'agent_response' after successful save
+12. Complete the orchestrator task/step
 
 PHS Integration:
 - Stamps agent responses with current baseline_id and momentary_id via get_current_phs_snapshot().
 - Triggers momentary shift 'agent_response' via phs_cache after saving the response.
+- Loads momentary state text from state.self_knowledge for {{my_state}} placeholder.
+- Merges affective generation parameters over prompt defaults (affective has priority).
 - Does NOT perform PHS calculations directly.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __description__ = "Module for generating the final response to the user"
 
 
@@ -35,6 +46,7 @@ from db_manager.db_manager import load_postgres_config
 from model_service.model_service import ModelService
 from services.tokens_counter import count_tokens_qwen
 from services.service_metrics import (
+    mark_task_running,
     create_orchestrator_step,
     complete_step_success,
     complete_step_error,
@@ -43,6 +55,7 @@ from services.service_metrics import (
     save_llm_metrics,
     save_reasoning,
     set_step_reasoning_id,
+    save_llm_artifacts,
 )
 from version import __version__ as agent_version
 
@@ -64,28 +77,27 @@ CONTEXT_SAFETY_MARGIN_PERCENT: float = 0.9  # 10% запас
 HISTORY_MESSAGE_LIMIT: int = 10
 
 
-def _render_system_prompt(prompt_text: str) -> str:
+def _render_system_prompt(prompt_text: str, my_state_text: str = "Ничего не чувствую.") -> str:
     """
-    Подставляет заглушки в системный промпт вместо недоступных данных.
-    Используется временно, пока нет модулей my_state, knowledge_self и т.д.
+    Подставляет данные в системный промпт.
     
-    Заглушки:
-        {{my_state}}           → "Ничего не чувствую."
-        {{knowledge_self}}      → "Ничего не знаю о себе."
-        {{knowledge_user}}      → "Ничего не знаю о пользователе."
-        {{knowledge_topic}}     → "Не знаю, опираюсь на то что в диалоге."
+    Плейсхолдеры:
+        {{my_state}}           →  Текстовое описание текущего состояния из self_knowledge
+        {{knowledge_self}}      →  "Ничего не знаю о себе."
+        {{knowledge_user}}      →  "Ничего не знаю о пользователе."
+        {{knowledge_topic}}     →  "Не знаю, опираюсь на то что есть в диалоге."
     """
     replacements = {
-        "{{my_state}}": "Ничего не чувствую.",
+        "{{my_state}}": my_state_text,
         "{{knowledge_self}}": "Ничего не знаю о себе.",
         "{{knowledge_user}}": "Ничего не знаю о пользователе.",
         "{{knowledge_topic}}": "Не знаю, опираюсь на то что есть в диалоге."
     }
+    
     rendered = prompt_text
     for placeholder, value in replacements.items():
         rendered = rendered.replace(placeholder, value)
     return rendered
-
 
 def _build_history_context(db_config: dict, session_id: str, current_message_id: str) -> tuple[list[dict], list[str]]: 
     """
@@ -117,20 +129,32 @@ def _build_history_context(db_config: dict, session_id: str, current_message_id:
                 message_ids.append(str(row["id"]))  # ← сохраняем UUID как строку
 
             return messages, message_ids
-            
 
 def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     """
-    Генерация финального ответа пользователю.
+    Генерирует финальный ответ пользователю.
     
-    Применяет сдвиг momentary (agent_response) к ПГС агента при сохранении сообщения.
-    Сохраняет штампы momentary b baseline ПГС.
-    Args:
-        task_id (str): UUID задачи оркестратора
-        input_data (dict): {"message_id": "<uuid>"}
+    Логика:
+    1. Читает промпт и параметры генерации из orchestrator.prompts
+    2. Загружает настройки из state.settings:
+       - use_momentary_state_in_generation: подставлять ли {{my_state}}
+       - use_affective_gen_params: использовать ли параметры из анализа
+    3. Если use_momentary_state_in_generation=1.0:
+       - Читает state.self_knowledge.content через momentary.state_id
+       - Подставляет в плейсхолдер {{my_state}}
+    4. Если use_affective_gen_params=1.0:
+       - Читает recommended_gen_params из последнего affective_analyses
+       - Мерджит поверх промптовых параметров
+    5. Строит историю диалога (последние N сообщений)
+    6. Вызывает ModelService.generate()
+    7. Сохраняет полные артефакты в metrics.llm_artifacts
+    8. Сохраняет ответ в dialogs.row_messages
+    9. Завершает задачу
     """
     db_config = load_postgres_config()
+    mark_task_running(task_id)
     message_id = input_data.get("message_id")
+    momentary_id = None
 
     if not message_id:
         error_msg = f"Missing message_id in task {task_id} input_data"
@@ -171,6 +195,11 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     )
     logger.debug(f"Active dialogue ID: {dialogue_id[:8]}")
 
+    # === 1.2 Получаем штампы ПГС ( РАНЬШЕ, чем нужны для подстановки состояния) ===
+    from phs_service.phs_cache import get_current_phs_snapshot
+    baseline_id, momentary_id = get_current_phs_snapshot(db_config, user_actor_id)
+    logger.debug(f"PHS snapshot: baseline={baseline_id[:8] if baseline_id else 'None'}, momentary={momentary_id[:8] if momentary_id else 'None'}")
+    
     # === 2. Загрузка промпта и параметров генерации ===
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -194,9 +223,63 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             raw_system_prompt = prompt["text"]
             model_params = prompt["params"] or {}
 
-    # === 3 Подстановка заглушек в системный промпт ===
-    system_prompt = _render_system_prompt(raw_system_prompt)
-    logger.debug("System prompt rendered with stubs")
+    # === 2.1 Загружаем настройки из state.settings ===
+        use_momentary_state = False
+        use_affective_params = False
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value_float FROM state.settings WHERE param_name = %s",
+                ("use_momentary_state_in_generation",)
+            )
+            row = cur.fetchone()
+            use_momentary_state = bool(row and row[0] and float(row[0]) > 0.0)
+            
+            cur.execute(
+                "SELECT value_float FROM state.settings WHERE param_name = %s",
+                ("use_affective_gen_params",)
+            )
+            row = cur.fetchone()
+            use_affective_params = bool(row and row[0] and float(row[0]) > 0.0)
+        
+        logger.info(
+            f"Generation settings: use_momentary_state={use_momentary_state}, "
+            f"use_affective_params={use_affective_params}"
+        )
+        
+    # === 2.2 Подстановка состояния из self_knowledge ===
+    my_state_text = "Ничего не чувствую."
+    if use_momentary_state and momentary_id:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT sk.content
+                FROM state.momentary m
+                JOIN state.self_knowledge sk ON m.state_id = sk.id
+                WHERE m.id = %s
+            """, (momentary_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                my_state_text = row[0]
+                logger.debug(f"Loaded momentary state: {len(my_state_text)} chars")
+        
+    # === 2.3 Загрузка параметров из аффективного анализа ===
+    affective_params = {}
+    if use_affective_params:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT aa.recommended_gen_params
+                FROM dialogs.row_messages rm
+                JOIN state.affective_analyses aa ON rm.phs_affective_analysis_id = aa.id
+                WHERE rm.id = %s
+            """, (message_id,))
+            row = cur.fetchone()
+            if row and row.get('recommended_gen_params'):
+                affective_params = dict(row['recommended_gen_params'])
+                logger.info(f"Loaded affective gen_params: {affective_params}")
+
+    # === 3 Подстановка плейсхолдеров в системный промпт ===
+    system_prompt = _render_system_prompt(raw_system_prompt, my_state_text)
+    logger.debug("System prompt rendered with momentary state")
 
     # === 4. Формирование контекста (только история) ===
     history_messages, history_message_ids = _build_history_context(db_config, session_id, message_id)
@@ -261,17 +344,16 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         count_tokens_qwen(user_content)
     )
 
-    # === 4.2 Получаем штампы ПГС для шага, ответа и рассуждений ===
-    from phs_service.phs_cache import get_current_phs_snapshot
-    baseline_id, momentary_id = get_current_phs_snapshot(db_config, user_actor_id)
-
     # === 5. Создание шага оркестратора ===
     step_input = {
         "message_id": message_id,
         "prompt_id": prompt_id,
         "token_count": total_input_tokens,
         "history_messages_count": len(history_messages),
-        "history_message_ids": history_message_ids
+        "history_message_ids": history_message_ids,
+        "use_momentary_state": use_momentary_state,
+        "use_affective_params": use_affective_params,
+        "my_state_length": len(my_state_text),
     }
     step_id = create_orchestrator_step(
         task_id=task_id,
@@ -302,6 +384,13 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             "presence_penalty", "repetition_penalty", "stop", "chat_template_kwargs"
         ]
     }
+
+    # Мердж параметров из аффективного анализа поверх промптовых
+    if affective_params:
+        for key in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty"]:
+            if key in affective_params:
+                safe_params[key] = affective_params[key]
+        logger.info(f"Final params after affective merge: {safe_params}")
 
     model = ModelService()
 
@@ -384,6 +473,15 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         net_latency=0.0,
         full_time=0.0,
         error_status=False
+    )
+
+    # === 10.1 Сохранение артефактов (полный промпт + ответ + параметры) ===
+    save_llm_artifacts(
+        llm_metric_id=llm_metric_id,
+        orchestrator_step_id=step_id,
+        messages=messages,
+        raw_response=clean_response,
+        final_params=safe_params
     )
 
     # === 11. Расчёт задержки ответа (answer_latency) ===

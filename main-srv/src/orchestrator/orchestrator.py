@@ -6,7 +6,8 @@ Main loop of the AGI task orchestrator.
 Features:
 - Singleton background thread with safe task retrieval (FOR UPDATE SKIP LOCKED).
 - Concurrency control: one task at a time via _composer_busy flag.
-- Task handlers: user_answer_generation, phs_baseline_drift, phs_momentary_decay.
+- Task dependency enforcement: tasks with parent_task_id wait for parent completion.
+- Task handlers: phs_affective_analysis, user_answer_generation, phs_baseline_drift, phs_momentary_decay.
 - Fault tolerance: errors logged, loop continues.
 - Lifecycle integration: check_inactivity and dialogue timeouts on each pulse.
 
@@ -15,9 +16,10 @@ Architecture:
 - Tasks created by orchestrator_entry or phs_scheduler.
 - Handlers dispatched via mapping dict, executed in separate threads.
 - Metrics updated via service_metrics module.
+- Task execution order enforced by priority and parent_task_id checks.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
@@ -96,11 +98,11 @@ def _cleanup_dangling_records(db_config: dict):
                 logger.warning("Cleared %d dangling tasks on startup", tasks_count)
             if steps_count > 0:
                 logger.warning("Cleared %d dangling steps on startup", steps_count)
-            
 
 def _get_pending_task(db_config: dict, task_type_name: str):
     """
     Извлекает следующую ожидающую задачу указанного типа из БД.
+    Пропускает задачи, у которых parent_task_id не завершён.
     Использует FOR UPDATE SKIP LOCKED для защиты от дублирования при многопоточности.
     
     Args:
@@ -113,17 +115,39 @@ def _get_pending_task(db_config: dict, task_type_name: str):
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT t.id, t.input_data
+                SELECT t.id, t.input_data, t.parent_task_id
                 FROM orchestrator.orchestrator_tasks t
                 JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
                 WHERE t.status = 'pending'::task_status
                   AND tt.type_name = %s
-                ORDER BY t.created_at ASC
+                ORDER BY t.priority DESC, t.created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             """, (task_type_name,))
-            return cur.fetchone()
+            task = cur.fetchone()
+            
+            if not task:
+                return None
 
+            # === ПРОВЕРКА ЗАВИСИМОСТИ ===
+            parent_id = task.get('parent_task_id')
+            if parent_id:
+                cur.execute("""
+                    SELECT status FROM orchestrator.orchestrator_tasks WHERE id = %s
+                """, (parent_id,))
+                parent_row = cur.fetchone()
+                
+                # Если родитель не завершён — пропускаем задачу в этом пульсе
+                if not parent_row or parent_row['status'] != 'completed':
+                    logger.debug(
+                        f"Task {task['id'][:8]} skipped: parent {parent_id[:8]} "
+                        f"status={parent_row['status'] if parent_row else 'missing'}"
+                    )
+                    # Снимаем блокировку, возвращая задачу в очередь
+                    conn.rollback()
+                    return None
+            
+            return task
 
 def _handle_answer_generation(task_id: str, input_data: dict) -> None:
     """
@@ -170,7 +194,6 @@ def _handle_momentary_decay(task_id: str, input_data: dict) -> None:
     finally:
         with _composer_lock:
             _composer_busy = False
-
         
 def _handle_phs_drift(task_id: str, input_data: dict):
     """
@@ -190,6 +213,24 @@ def _handle_phs_drift(task_id: str, input_data: dict):
         with _composer_lock:
             _composer_busy = False
 
+def _handle_affective_analysis(task_id: str, input_data: dict) -> None:
+    """
+    Обработчик задачи пре-рефлексивного аффективного анализа.
+    
+    Вызывает affective_analyzer.handle_affective_analysis, завершает задачу, сбрасывает флаг.
+    Запускается в отдельном потоке.
+    """
+    global _composer_busy
+    try:
+        from phs_service.affective_analyzer import handle_affective_analysis
+        handle_affective_analysis(task_id=task_id, input_data=input_data)
+    except Exception as e:
+        logger.exception("PHS affective analysis task failed (task_id=%s): %s", task_id[:8], e)
+        from services.service_metrics import complete_task_error
+        complete_task_error(task_id, "affective_analyzer", str(e))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
 
 def _get_task_type_name(db_config: dict, task_id: str) -> str:
     """Возвращает type_name задачи по её ID."""
@@ -203,8 +244,7 @@ def _get_task_type_name(db_config: dict, task_id: str) -> str:
             """, (task_id,))
             row = cur.fetchone()
             return row[0] if row else "unknown"
-        
-
+ 
 def load_pulse_seconds(db_config: dict) -> int:
     """Загружает orchestrator_pulse_seconds из state.settings."""
     try:
@@ -220,7 +260,6 @@ def load_pulse_seconds(db_config: dict) -> int:
     except Exception:
         logger.warning("Failed to load orchestrator_pulse_seconds from DB, using default=1")
         return 1
-    
 
 def _orchestrator_loop():
     """
@@ -230,10 +269,13 @@ def _orchestrator_loop():
     1. Проверяет таймаут бездействия (lifecycle).
     2. Проверяет таймауты диалогов.
     3. Если не занят — извлекает задачу по приоритету:
-       - user_answer_generation
-       - phs_baseline_drift
-       - phs_momentary_decay
+       - phs_affective_analysis (prio 0.85)
+       - user_answer_generation (prio 0.7)
+       - phs_baseline_drift (prio 0.3)
+       - phs_momentary_decay (prio 0.4)
     4. Запускает обработчик в отдельном потоке.
+    
+    Задачи с parent_task_id пропускаются, если родитель не завершён.
     """
     global _composer_busy, _running
 
@@ -252,14 +294,18 @@ def _orchestrator_loop():
             
             if not _composer_busy:
                 # === ИЗВЛЕЧЕНИЕ ЗАДАЧИ ПО ПРИОРИТЕТУ ===
-                # 1. Ответ пользователю
-                task = _get_pending_task(db_config, "user_answer_generation")
+                # 1. Аффективный анализ (высший приоритет)
+                task = _get_pending_task(db_config, "phs_affective_analysis")
                 
-                # 2. Дрейф baseline
+                # 2. Ответ пользователю
+                if not task:
+                    task = _get_pending_task(db_config, "user_answer_generation")
+                
+                # 3. Дрейф baseline
                 if not task:
                     task = _get_pending_task(db_config, "phs_baseline_drift")
                 
-                # 3. Затухание momentary ← ДОБАВЛЕНО
+                # 4. Затухание momentary ← ДОБАВЛЕНО
                 if not task:
                     task = _get_pending_task(db_config, "phs_momentary_decay")
                 
@@ -275,6 +321,7 @@ def _orchestrator_loop():
                     
                     # Маппинг типов → обработчиков
                     handlers: Dict[str, Callable] = {
+                        "phs_affective_analysis": _handle_affective_analysis,
                         "user_answer_generation": _handle_answer_generation,
                         "phs_baseline_drift": _handle_phs_drift,
                         "phs_momentary_decay": _handle_momentary_decay,
@@ -302,7 +349,6 @@ def _orchestrator_loop():
             logger.exception("Critical error in orchestrator loop: %s", exc)
             time.sleep(pulse_seconds)
 
-
 def start_orchestrator() -> threading.Thread | None:
     """
     Запускает оркестратор в фоновом потоке.
@@ -326,7 +372,6 @@ def start_orchestrator() -> threading.Thread | None:
 
     logger.info("Orchestrator background thread started")
     return thread
-
 
 def stop_orchestrator():
     """
