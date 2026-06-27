@@ -1,7 +1,3 @@
-Понял, извиняюсь за путаницу. Убираю раздел "Project Structure" с деревом файлов (он действительно дублирует то, что уже лежит в `docs/`). Вот обновлённая инструкция без этого раздела:
-
----
-
 **Kaya AI Agent: Development Status & Quick Start Guide**  
 
 > **Status:** Active development (pre‑v1.1) | **License:** AGPL‑3.0  
