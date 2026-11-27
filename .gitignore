@@ -28,6 +28,7 @@ README_ru.md
 README.md
 *.swp
 *.swo
+.clinerules
 
 # System files
 .DS_Store
