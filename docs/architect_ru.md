@@ -16,12 +16,16 @@ agent/
 ├── main-srv/                    # Основной сервер
 │    ├── .venv/                  # Виртуальное окружение Python
 │    │
+│    ├── configs/                # Конфигурации агента
+│    │   ├── postgres_config.yaml  # Настройки подключения к PostgreSQL
+│    │   └── qdrant_config.yaml    # Настройки подключения к Qdrant
+│    │
 │    ├── llama.cpp/               # Субмодуль llama.cpp (форк)
 │    │   ├── build/               # Собранные бинарники (игнорируется git)
 │    │   └── ...                  # Исходники llama.cpp
 │    │
 │    ├── logs/                    # Логи работы агента
-│    │   └── kaya_full.log        # Полный лог (DEBUG+)
+│    │   └── agent_full.log      # Полный лог (DEBUG+)
 │    │
 │    ├── models/                  # LLM модели (игнорируется git)
 │    │   ├── qwen3_5/
@@ -34,7 +38,19 @@ agent/
 │    │
 │    ├── scripts/
 │    │   └── start_llama-server.sh # Скрипт запуска локального llama-server (API)
-│
+│    │
+│    └── src/                     # Исходный код Python
+│        ├── __init__.py
+│        ├── main.py              # Точка входа (запуск агента)
+│        ├── version.py           # Глобальная версия из pyproject.toml
+│        │
+│        └── db_manager/          # Управление БД
+│            ├── __init__.py
+│            ├── db_manager.py    # Подключение к PostgreSQL и Qdrant
+│            └── migrations/
+│                ├── __init__.py
+│                ├── pg_migration_manager.py  # Менеджер применения миграций БД
+│                └── V001_initial.sql         # Начальная схема (основные таблицы агента)
 │
 └── docs/                         # Документация
      ├── architect.md             # Архитектура проекта (English)

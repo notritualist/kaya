@@ -1,0 +1,5 @@
+# /main-srv/configs/qdrant_config.yaml
+host: "main-srv"
+port: 6333
+collection_name: "kaya_db"
+vector_size: 2560
